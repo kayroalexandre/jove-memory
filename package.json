@@ -1,0 +1,20 @@
+{
+  "name": "jove-memory",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Persistent self-hosted memory server for coding agents. PostgreSQL-backed, cloud-model-only.",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/api/server.mjs",
+    "mcp": "node src/mcp/server.mjs",
+    "migrate": "node src/store/migrate.mjs",
+    "test": "node --test test/",
+    "lint": "node scripts/lint.mjs",
+    "secret-scan": "node scripts/secret-scan.mjs",
+    "calibrate": "node src/decisions/calibrate.mjs"
+  }
+}

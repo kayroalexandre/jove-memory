@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Local data (may contain memory content)
+data/
+pgdata/
+minio-data/
+*.sqlite
+*.sqlite3
+*.db
+*.brain
+snapshots/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
