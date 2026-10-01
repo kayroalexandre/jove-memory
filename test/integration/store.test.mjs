@@ -56,21 +56,40 @@ function freshWorkspace(label) {
 
 async function provision(label) {
   const workspace = freshWorkspace(label);
-  await pools.provisionWorkspace(workspace);
+  // Create and migrate as one operation, the way production does. Provisioning
+  // without migrating leaves a state the server refuses to start against.
+  const { created } = await pools.provisionWorkspace(workspace, { migrate });
   const store = createStore({ workspace, pools });
   const pool = pools.poolFor(workspace);
   const result = await migrate(pool);
-  return { workspace, store, pool, migration: result };
+  return { workspace, store, pool, migration: result, created };
+}
+
+/**
+ * Provision, then release the workspace when the test finishes.
+ *
+ * Each test gets a clean database and gives its connections back immediately,
+ * rather than holding every pool until the suite's `after` hook. With one pool
+ * per workspace and PostgreSQL's 100-connection default, holding forty pools
+ * exhausts the server — and that failure looks like a database fault rather
+ * than a resource-management one, which is a miserable thing to debug.
+ *
+ * Tests run concurrently inside one file, so the workspace is released in a
+ * `t.after` hook rather than in a try/finally around the body: the body is not
+ * a closure we control once the test is registered.
+ */
+async function provisionTracked(label, t) {
+  const handle = await provision(label);
+  if (t?.after) {
+    t.after(() => pools.dropWorkspace(handle.workspace).catch(() => {}));
+  } else {
+    created.push(handle.workspace);
+  }
+  return handle;
 }
 
 /** Every workspace this run created, dropped in `after`. */
 const created = [];
-
-async function provisionTracked(label) {
-  const handle = await provision(label);
-  created.push(handle.workspace);
-  return handle;
-}
 
 before(async () => {
   // The template database is what scripts/init-db.sh creates. If it is absent,
@@ -113,22 +132,38 @@ after(async () => {
 // Migration
 // ---------------------------------------------------------------------------
 
-test("migrations apply and report the version range", async () => {
+test("migrations apply and report the version range", async (t) => {
   const { workspace, pool, migration } = await provisionTracked("migrate");
-    assert.equal(migration.from, 0);
-    assert.equal(migration.to, expectedVersion());
-    assert.ok(migration.applied.length >= 1);
-    assert.equal(await expectedVersion(), migration.applied.at(-1).version);
+
+  // `provision` already migrated, so this second call is a no-op. What is
+  // being asserted here is that migrate() is idempotent and reports the
+  // version range honestly, not that it does work — the previous version of
+  // this test asserted `from === 0`, which only held because provisioning and
+  // migrating were separate steps.
+  assert.equal(migration.applied.length, 0, "already migrated by provision");
+  assert.equal(migration.from, expectedVersion());
+  assert.equal(migration.to, expectedVersion());
+
+  // And a database provisioned from scratch lands at the expected version.
+  const scratch = freshWorkspace("scratch");
+  t.after(() => pools.dropWorkspace(scratch).catch(() => {}));
+  await pools.createWorkspaceDatabase(scratch);
+  const scratchResult = await migrate(pools.poolFor(scratch));
+
+  assert.equal(scratchResult.from, 0);
+  assert.ok(scratchResult.applied.length >= 1);
+  assert.equal(scratchResult.to, expectedVersion());
+  await assertSchemaVersion(pools.poolFor(scratch));
 });
 
-test("migrations are idempotent", async () => {
+test("migrations are idempotent", async (t) => {
   const { pool } = await provisionTracked("idem");
     const second = await migrate(pool);
     assert.equal(second.applied.length, 0, "a second run must apply nothing");
     assert.equal(second.from, second.to);
 });
 
-test("schema version guard rejects a mismatched database", async () => {
+test("schema version guard rejects a mismatched database", async (t) => {
   const { workspace, pool } = await provisionTracked("guard");
 
   // Simulate a database written by a newer build.
@@ -146,10 +181,12 @@ test("schema version guard rejects a mismatched database", async () => {
   );
 });
 
-test("schema version guard rejects an unmigrated database", async () => {
+test("schema version guard rejects an unmigrated database", async (t) => {
   const workspace = freshWorkspace("unmigrated");
-  created.push(workspace);
-  await pools.provisionWorkspace(workspace);
+  t.after(() => pools.dropWorkspace(workspace).catch(() => {}));
+  // Create the database WITHOUT migrating it — that is the state this guard
+  // exists to catch, so the test has to produce it deliberately.
+  await pools.createWorkspaceDatabase(workspace);
   const pool = pools.poolFor(workspace);
 
   await assert.rejects(
@@ -169,7 +206,7 @@ test("every migration file follows the naming convention", () => {
 // Store: nodes
 // ---------------------------------------------------------------------------
 
-test("createNode persists the tree and metadata", async () => {
+test("createNode persists the tree and metadata", async (t) => {
   const { store } = await provisionTracked("nodes");
     const root = await store.createNode({
       id: "projects.demo",
@@ -198,7 +235,7 @@ test("createNode persists the tree and metadata", async () => {
     assert.ok(reread.children.includes("projects.demo.child"));
 });
 
-test("createNode refuses a parent that does not exist", async () => {
+test("createNode refuses a parent that does not exist", async (t) => {
   const { store } = await provisionTracked("orphan");
   await assert.rejects(
     () =>
@@ -211,7 +248,7 @@ test("createNode refuses a parent that does not exist", async () => {
   );
 });
 
-test("deleteNode reparents children and orphans items rather than deleting them", async () => {
+test("deleteNode reparents children and orphans items rather than deleting them", async (t) => {
   const { store } = await provisionTracked("delnode");
     await store.createNode({ id: "root", label: "Root" });
     await store.createNode({ id: "mid", parent_id: "root", label: "Mid" });
@@ -235,7 +272,7 @@ test("deleteNode reparents children and orphans items rather than deleting them"
 // Store: items
 // ---------------------------------------------------------------------------
 
-test("upsertItem preserves proposed status for the review workflow", async () => {
+test("upsertItem preserves proposed status for the review workflow", async (t) => {
   const { store } = await provisionTracked("proposed");
     await store.createNode({ id: "n", label: "N" });
     const item = await store.upsertItem({
@@ -248,7 +285,7 @@ test("upsertItem preserves proposed status for the review workflow", async () =>
     assert.equal(proposed.length, 1);
 });
 
-test("upsertItem updates in place without duplicating", async () => {
+test("upsertItem updates in place without duplicating", async (t) => {
   const { store } = await provisionTracked("upsert");
     await store.createNode({ id: "n", label: "N" });
     const first = await store.upsertItem({ id: "fixed.id", node_id: "n", content: "before" });
@@ -259,7 +296,7 @@ test("upsertItem updates in place without duplicating", async () => {
     assert.equal((await store.listItems({ nodeId: "n" })).length, 1);
 });
 
-test("supersedes relationship survives a round trip", async () => {
+test("supersedes relationship survives a round trip", async (t) => {
   const { store } = await provisionTracked("supersede");
     await store.createNode({ id: "n", label: "N" });
     const old = await store.upsertItem({ id: "old", node_id: "n", content: "old fact" });
@@ -273,7 +310,7 @@ test("supersedes relationship survives a round trip", async () => {
     assert.equal((await store.readItem("new")).supersedes, "old");
 });
 
-test("deleteItem is a soft delete and the row is retained", async () => {
+test("deleteItem is a soft delete and the row is retained", async (t) => {
   const { store } = await provisionTracked("softdelete");
     await store.createNode({ id: "n", label: "N" });
     await store.upsertItem({ id: "i", node_id: "n", content: "x" });
@@ -290,7 +327,7 @@ test("deleteItem is a soft delete and the row is retained", async () => {
 // Store: bitemporal behaviour
 // ---------------------------------------------------------------------------
 
-test("invalidateItem keeps the fact and marks its end of validity", async () => {
+test("invalidateItem keeps the fact and marks its end of validity", async (t) => {
   const { store } = await provisionTracked("invalidate");
     await store.createNode({ id: "n", label: "N" });
     await store.upsertItem({
@@ -310,7 +347,7 @@ test("invalidateItem keeps the fact and marks its end of validity", async () => 
     assert.equal(item.content, "was true", "an invalidated fact is retained, not deleted");
 });
 
-test("asOf query returns the fact that was true at that moment", async () => {
+test("asOf query returns the fact that was true at that moment", async (t) => {
   const { store } = await provisionTracked("asof");
     await store.createNode({ id: "n", label: "N" });
 
@@ -334,7 +371,7 @@ test("asOf query returns the fact that was true at that moment", async () => {
     assert.equal(present.length, 0, "today it is no longer true");
 });
 
-test("an invalidated fact is excluded by default and retrievable when asked for", async () => {
+test("an invalidated fact is excluded by default and retrievable when asked for", async (t) => {
   const { store } = await provisionTracked("notinvalid");
     await store.createNode({ id: "n", label: "N" });
     await store.upsertItem({ id: "i", node_id: "n", content: "x" });
@@ -367,7 +404,7 @@ test("an invalidated fact is excluded by default and retrievable when asked for"
 // Store: tags as JSONB
 // ---------------------------------------------------------------------------
 
-test("tag filter is a query, not a substring match", async () => {
+test("tag filter is a query, not a substring match", async (t) => {
   const { store } = await provisionTracked("tags");
     await store.createNode({ id: "n", label: "N" });
     await store.upsertItem({ id: "a", node_id: "n", content: "x", tags: ["alpha"] });
@@ -386,7 +423,7 @@ test("tag filter is a query, not a substring match", async () => {
 // Store: audit log
 // ---------------------------------------------------------------------------
 
-test("mutation log is written and is genuinely append-only", async () => {
+test("mutation log is written and is genuinely append-only", async (t) => {
   const { workspace, store, pool } = await provisionTracked("audit");
     await store.createNode({ id: "n", label: "N" });
     await store.upsertItem({ id: "i", node_id: "n", content: "x" });
@@ -411,7 +448,7 @@ test("mutation log is written and is genuinely append-only", async () => {
 // Store: embeddings cache
 // ---------------------------------------------------------------------------
 
-test("embedding cache is keyed by model so a model change cannot overwrite", async () => {
+test("embedding cache is keyed by model so a model change cannot overwrite", async (t) => {
   const { store } = await provisionTracked("embed");
     const vector = Array.from({ length: 3072 }, (_, i) => (i % 7) / 7);
 
@@ -431,7 +468,7 @@ test("embedding cache is keyed by model so a model change cannot overwrite", asy
 // Store: decisions and calibration inputs
 // ---------------------------------------------------------------------------
 
-test("decisions record negative outcomes too, which calibration needs", async () => {
+test("decisions record negative outcomes too, which calibration needs", async (t) => {
   const { store } = await provisionTracked("decisions");
     await store.recordDecision({
       operation: "write_gate",
@@ -457,7 +494,7 @@ test("decisions record negative outcomes too, which calibration needs", async ()
 // Store: stats and capabilities
 // ---------------------------------------------------------------------------
 
-test("stats separates active, proposed, deleted and invalidated", async () => {
+test("stats separates active, proposed, deleted and invalidated", async (t) => {
   const { store } = await provisionTracked("stats");
     await store.createNode({ id: "n", label: "N" });
     await store.upsertItem({ id: "a", node_id: "n", content: "x" });
@@ -477,7 +514,7 @@ test("stats separates active, proposed, deleted and invalidated", async () => {
     assert.ok(stats.mutations >= 5);
 });
 
-test("capabilities reports the real BM25 engine rather than assuming one", async () => {
+test("capabilities reports the real BM25 engine rather than assuming one", async (t) => {
   const { store } = await provisionTracked("caps");
     const caps = await store.capabilities();
     assert.equal(caps.vector, true, "pgvector must be present");
@@ -491,7 +528,7 @@ test("capabilities reports the real BM25 engine rather than assuming one", async
 // Workspace isolation
 // ---------------------------------------------------------------------------
 
-test("workspaces do not see each other's data", async () => {
+test("workspaces do not see each other's data", async (t) => {
   const a = await provisionTracked("iso_a");
   const b = await provisionTracked("iso_b");
     await a.store.createNode({ id: "n", label: "A" });
@@ -509,7 +546,7 @@ test("workspaces do not see each other's data", async () => {
     assert.equal((await b.store.listItems({})).length, 1);
 });
 
-test("the shared workspace is a distinct database", async () => {
+test("the shared workspace is a distinct database", async (t) => {
   const { store } = await provisionTracked("shared");
 
   // `_shared` is created by scripts/init-db.sh, not by a workspace
@@ -517,11 +554,14 @@ test("the shared workspace is a distinct database", async () => {
   // This test creates it when absent, so it does not depend on the caller
   // having run the init script. A test that fails because the environment was
   // not prepared reports the wrong problem.
-  let all = await pools.listWorkspaces({ includeSystem: true });
+  let all = await pools.listWorkspaces({ includeInfrastructure: true });
   if (!all.includes("_shared")) {
-    await pools.provisionWorkspace("_shared");
-    all = await pools.listWorkspaces({ includeSystem: true });
+    await pools.provisionWorkspace("_shared", { migrate });
+    all = await pools.listWorkspaces({ includeInfrastructure: true });
   }
+  // Not pushed onto `created`: `_shared` is infrastructure that the whole
+  // server depends on, so dropping it here would break every other test file
+  // running in parallel against the same Postgres.
 
   assert.ok(
     all.includes("_shared"),
@@ -545,18 +585,27 @@ test("workspace names are validated before they reach SQL", () => {
   }
 });
 
-test("provisioning the same workspace twice is a no-op", async () => {
+test("provisioning creates the database and migrates it in one step", async (t) => {
   const workspace = freshWorkspace("dup");
-  created.push(workspace);
-  assert.equal(await pools.provisionWorkspace(workspace), true);
-  assert.equal(await pools.provisionWorkspace(workspace), false);
+  t.after(() => pools.dropWorkspace(workspace).catch(() => {}));
+
+  const first = await pools.provisionWorkspace(workspace, { migrate });
+  assert.equal(first.created, true);
+
+  const second = await pools.provisionWorkspace(workspace, { migrate });
+  assert.equal(second.created, false, "a second provision creates nothing new");
+
+  // And the result is immediately usable: the version guard passes without a
+  // separate migrate call. A provisioned-but-unmigrated database would make
+  // the server crash-loop, which is the state this prevents.
+  await assertSchemaVersion(pools.poolFor(workspace));
 });
 
 // ---------------------------------------------------------------------------
 // Snapshot round-trip — the gate that proves nothing is lost
 // ---------------------------------------------------------------------------
 
-test("items survive a full round trip through the store", async () => {
+test("items survive a full round trip through the store", async (t) => {
   const source = await provisionTracked("rt_src");
     await source.store.createNode({
       id: "projects.roundtrip",

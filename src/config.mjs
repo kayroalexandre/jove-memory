@@ -45,7 +45,15 @@ export function loadConfig(env = process.env) {
   try {
     return {
       server: {
-        host: optional("PARADIGM_HOST", "127.0.0.1"),
+        // Binds 0.0.0.0 *inside the container*. That is not exposure: the
+        // host publishes this port on 127.0.0.1 only (compose.yml), so the
+        // service is unreachable from the network.
+        //
+        // The distinction matters. Binding 127.0.0.1 inside a container makes
+        // the port unreachable from the Docker bridge, which is why the
+        // container's own healthcheck and the host's published port both fail
+        // while the logs cheerfully say "listening".
+        host: optional("PARADIGM_HOST", "0.0.0.0"),
         port: int("PARADIGM_API_PORT", 8888),
         logLevel: optional("PARADIGM_LOG_LEVEL", "info")
       },
@@ -57,7 +65,7 @@ export function loadConfig(env = process.env) {
         superuser: optional("POSTGRES_SUPERUSER", "paradigm"),
         password: required("POSTGRES_PASSWORD"),
         database: optional("POSTGRES_DB", "paradigm"),
-        poolMaxPerWorkspace: int("POSTGRES_POOL_MAX_PER_WORKSPACE", 10)
+        poolMaxPerWorkspace: int("POSTGRES_POOL_MAX_PER_WORKSPACE", 4)
       },
 
       minio: {
@@ -70,7 +78,14 @@ export function loadConfig(env = process.env) {
       },
 
       providers: {
-        apiKey: required("OPENROUTER_API_KEY"),
+        // Not `required`. The stack must be able to start, and serve health,
+        // before any key exists — that is Phase 2's whole gate. A missing key
+        // makes every provider-backed operation fail loudly at the call site,
+        // which is where the error is actionable, rather than at boot where it
+        // only says "something is unset".
+        //
+        // The health endpoint reports the absence. Nothing silently degrades.
+        apiKey: optional("OPENROUTER_API_KEY", ""),
         baseUrl: optional("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
         embedModel: optional("PARADIGM_EMBED_MODEL", "google/gemini-embedding-2"),
         decisionModel: optional("PARADIGM_DECISION_MODEL", "upstage/solar-decide"),

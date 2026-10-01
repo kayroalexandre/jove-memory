@@ -21,6 +21,21 @@ const SAFE_NAME = /^[a-z][a-z0-9_]{0,62}$/;
 export const RESERVED = new Set(["postgres", "template0", "template1", "paradigm"]);
 
 /**
+ * Databases that exist but are not workspaces.
+ *
+ * `paradigm` is the maintenance database the admin connection uses, and
+ * `paradigm_template` is what new workspaces are cloned from. Both are listed
+ * by `pg_database`, so every listing has to filter them out — and a workspace
+ * loop that forgets produces a migration against the template, which is how
+ * you end up debugging a schema error in a database nothing uses.
+ */
+export const INFRASTRUCTURE_DATABASES = new Set(["paradigm", "paradigm_template"]);
+
+export function isInfrastructureDatabase(name) {
+  return INFRASTRUCTURE_DATABASES.has(name);
+}
+
+/**
  * The shared database holding entity edges that cross workspace boundaries.
  * It starts with an underscore, so it is exempt from SAFE_NAME. Declared here,
  * above the validators, because they reference it.
