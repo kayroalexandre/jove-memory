@@ -1,0 +1,93 @@
+name: CI
+
+# This workflow also provides the `secret-scan` status that branch protection
+# requires. It must pass before any pull request can merge.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  secret-scan:
+    name: secret-scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Scan the tree
+        run: node scripts/secret-scan.mjs
+
+      - name: Scan full history
+        # Catches a secret that was committed and then removed from the tree.
+        run: |
+          if git log -p --all | grep -nE \
+            'sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{30,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----' \
+            | grep -v 'secret-scan.mjs' \
+            | grep -v 'docs/SECURITY.md'; then
+            echo "::error::A credential-shaped string exists in git history"
+            exit 1
+          fi
+          echo "history clean"
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Lint
+        run: node scripts/lint.mjs
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Unit tests
+        # No database, no network. Anything that needs either runs in the
+        # integration job, and anything that needs a provider runs against
+        # a recorded fixture so the suite never costs money.
+        run: npm test
+
+  integration:
+    name: integration (postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg18
+        env:
+          POSTGRES_USER: paradigm
+          POSTGRES_PASSWORD: testpassword
+          POSTGRES_DB: paradigm
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U paradigm"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Integration tests
+        env:
+          TEST_DATABASE_URL: postgres://paradigm:testpassword@localhost:5432/paradigm
+        run: node --test test/integration/
