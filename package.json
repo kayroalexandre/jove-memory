@@ -14,9 +14,13 @@
     "migrate": "node src/store/migrate.mjs",
     "test": "node --test test/*.test.mjs",
     "test:integration": "node --test test/integration/*.test.mjs",
+    "test:all": "npm test && npm run test:integration",
     "lint": "node scripts/lint.mjs",
     "secret-scan": "node scripts/secret-scan.mjs",
     "calibrate": "node src/decisions/calibrate.mjs",
     "verify": "npm run lint && npm run secret-scan && npm test"
+  },
+  "dependencies": {
+    "pg": "^8.23.1"
   }
 }

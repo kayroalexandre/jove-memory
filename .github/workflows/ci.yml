@@ -90,9 +90,29 @@ jobs:
       - name: Integration tests
         env:
           TEST_DATABASE_URL: postgres://paradigm:testpassword@localhost:5432/paradigm
+          # Provisioning a workspace creates a database from this template. The
+          # template carries the extensions, so it has to exist before any test
+          # runs — scripts/init-db.sh does this on a real volume.
+          POSTGRES_PASSWORD: testpassword
         run: |
-          if [ -d test/integration ]; then
-            node --test test/integration/*.test.mjs
-          else
-            echo "no integration tests yet (Phase 1 adds them)"
+          if [ ! -d test/integration ]; then
+            echo "no integration tests yet"
+            exit 0
           fi
+
+          # Wait for the service container to accept connections.
+          for i in $(seq 1 30); do
+            if pg_isready -h localhost -U paradigm -d paradigm >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+
+          # Create the template database the app provisions workspaces from.
+          PGPASSWORD=testpassword psql -h localhost -U paradigm -d postgres -v ON_ERROR_STOP=1 <<'SQL'
+            CREATE DATABASE paradigm_template TEMPLATE template0;
+          SQL
+          PGPASSWORD=testpassword psql -h localhost -U paradigm -d paradigm_template -v ON_ERROR_STOP=1 <<'SQL'
+            CREATE EXTENSION IF NOT EXISTS vector;
+            CREATE EXTENSION IF NOT EXISTS pg_trgm;
+          SQL
+
+          node --test test/integration/*.test.mjs
