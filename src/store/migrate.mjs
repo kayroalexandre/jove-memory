@@ -2,6 +2,8 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { isInfrastructureDatabase } from "./workspace-name.mjs";
+
 /**
  * Migration runner.
  *
@@ -180,20 +182,18 @@ async function main() {
   const { loadConfig } = await import("../config.mjs");
   const { createLogger } = await import("../logger.mjs");
   const { createPoolManager } = await import("./pool.mjs");
-  const { listWorkspaces } = await import("./workspace-name.mjs");
-
-  void listWorkspaces;
 
   const config = loadConfig();
   const logger = createLogger({ level: config.server.logLevel });
   const pools = createPoolManager(config, { logger });
 
-  const workspaces = await pools.listWorkspaces();
-  if (workspaces.length === 0) {
+  const workspaces = await pools.listWorkspaces({ includeInfrastructure: true });
+  const relevant = workspaces.filter((name) => !isInfrastructureDatabase(name));
+  if (relevant.length === 0) {
     logger.warn("no workspace databases found — provision one first");
   }
 
-  for (const workspace of workspaces) {
+  for (const workspace of relevant) {
     const pool = pools.poolFor(workspace);
     const result = await migrate(pool, { logger });
     logger.info("migrations complete", {
@@ -202,6 +202,16 @@ async function main() {
       to: result.to,
       applied: result.applied.map((m) => m.file)
     });
+
+    if (result.applied.length > 0 && config.providers.apiKey === "") {
+      // Recorded once, not on every boot. The embedding model is written to
+      // schema_meta so a later model change is detectable.
+      await recordEmbeddingModel(
+        pool,
+        config.providers.embedModel,
+        config.embedding.dimensions
+      );
+    }
   }
 
   await pools.close();

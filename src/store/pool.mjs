@@ -45,9 +45,12 @@ export function createPoolManager(config, { logger = null } = {}) {
   /** @type {Map<string, pg.Pool>} */
   const pools = new Map();
 
-  function baseOptions() {
+  function baseOptions(overrideMax) {
     return {
-      max: config.postgres.poolMaxPerWorkspace,
+      // A small default on purpose. Each workspace gets its own pool, so the
+      // total is (workspaces × max). With PostgreSQL's default
+      // max_connections of 100, ten pools of twenty exhausts the server.
+      max: overrideMax ?? config.postgres.poolMaxPerWorkspace,
       // A statement that hangs is a leaked connection, not a slow query. The
       // database-level timeout is a second line of defence; this stops the
       // client from waiting forever when the server never answers.
@@ -127,7 +130,10 @@ export function createPoolManager(config, { logger = null } = {}) {
       const pool = new Pool({
         ...baseOptions(),
         connectionString: connectionString("postgres", config),
-        max: 2
+        max: 2,
+      // The maintenance connection is short-lived and single-threaded; a big
+      // pool here would compete with the workspace pools for connections.
+      connectionTimeoutMillis: 10_000
       });
       try {
         return await pool.connect();
@@ -155,14 +161,14 @@ export function createPoolManager(config, { logger = null } = {}) {
     },
 
     /**
-     * Provision a workspace database.
+     * Create a workspace database if it is not already there.
      *
-     * Explicit, never on first access (see issue #1): a typo in a workspace
-     * name must not create a stray empty database that looks like a real one.
      * `CREATE DATABASE` cannot run inside a transaction and cannot be
      * parameterised, which is why the identifier is quoted rather than bound.
+     * The quoting is the second line of defence; `assertWorkspaceName` has
+     * already rejected anything that is not a plain identifier.
      */
-    async provisionWorkspace(workspace) {
+    async createWorkspaceDatabase(workspace) {
       assertWorkspaceName(workspace);
       if (await this.workspaceExists(workspace)) return false;
 
@@ -193,14 +199,40 @@ export function createPoolManager(config, { logger = null } = {}) {
       return true;
     },
 
+    /**
+     * Provision a workspace: create the database and bring it to the current
+     * schema version.
+     *
+     * These are one operation from the caller's point of view on purpose. A
+     * database that exists but is unmigrated is a state the server has to
+     * defend against on every startup — and the schema-version guard will
+     * refuse to start against it, which turns "I created a workspace" into a
+     * container that crash-loops.
+     *
+     * The migrator is injected rather than imported. migrate.mjs is a sibling
+     * that does not import this module, so this keeps the dependency edge
+     * pointing one way.
+     */
+    async provisionWorkspace(workspace, { migrate: runMigrations = null } = {}) {
+      const created = await this.createWorkspaceDatabase(workspace);
+
+      if (runMigrations) {
+        await runMigrations(this.poolFor(workspace), { workspace });
+      }
+
+      // Migration opened the pool after CREATE DATABASE, so it is current.
+      // Nothing stale to drop here.
+      return { workspace, created };
+    },
+
     /** Every provisioned workspace database. */
-    async listWorkspaces({ includeSystem = false } = {}) {
+    async listWorkspaces({ includeInfrastructure = false } = {}) {
       const client = await this.admin();
       try {
         const { rows } = await client.query(
-          includeSystem
+          includeInfrastructure
             ? `SELECT datname FROM pg_database
-               WHERE datistemplate = false AND datname NOT IN ('postgres')
+               WHERE datistemplate = false AND datname <> 'postgres'
                ORDER BY datname`
             : `SELECT datname FROM pg_database
                WHERE datistemplate = false
@@ -222,8 +254,20 @@ export function createPoolManager(config, { logger = null } = {}) {
      */
     async dropWorkspace(workspace) {
       assertWorkspaceName(workspace);
+
+      // Close this workspace's pool BEFORE dropping. An open connection to a
+      // database prevents DROP DATABASE, and the error surfaces as a generic
+      // failure rather than as "you forgot to close the pool".
+      const pool = pools.get(workspace);
+      if (pool) {
+        pools.delete(workspace);
+        await pool.end().catch(() => {});
+      }
+
       const client = await this.admin();
       try {
+        // Terminate anything still attached, in case a pool elsewhere in the
+        // process is holding a connection this module does not own.
         await client.query(
           `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
            WHERE datname = $1 AND pid <> pg_backend_pid()`,
@@ -232,11 +276,6 @@ export function createPoolManager(config, { logger = null } = {}) {
         await client.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(workspace)}`);
       } finally {
         client.release();
-      }
-      const stale = pools.get(workspace);
-      if (stale) {
-        pools.delete(workspace);
-        stale.end().catch(() => {});
       }
       return true;
     },

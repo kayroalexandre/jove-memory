@@ -141,3 +141,41 @@ The image built without it. The system falls back to `tsvector` + GIN automatica
 **Cross-workspace results never appear**
 Check that entity edges exist in `_shared`. The traversal is deliberately fail-closed: no edge
 means no result, and the decision provider being down also means no result.
+
+---
+
+## Phase 2 notes — what running the stack actually revealed
+
+These are not in the plan, because a plan cannot know them until the stack runs.
+
+### The container must bind 0.0.0.0, and that is not exposure
+
+The API binds `0.0.0.0` inside the container. The host publishes that port on
+`127.0.0.1` only, so the service is unreachable from the network.
+
+Binding `127.0.0.1` *inside* a container makes the port unreachable from the
+Docker bridge. The container's own healthcheck fails, the host's published port
+fails, and the logs cheerfully report `listening` — which is the worst kind of
+bug, because every signal except the two that matter says it is fine.
+
+### `OPENROUTER_API_KEY` is not required at boot
+
+The stack has to start, and serve health, before any key exists — that is the
+whole point of Phase 2. A missing key makes every provider-backed operation fail
+at its call site, where the error is actionable, rather than at boot where it
+only says something is unset. `/health` reports the absence.
+
+### Provisioning and migrating are one operation
+
+`provisionWorkspace` creates the database *and* migrates it. An earlier version
+had them separate, which produced a container that crash-looped on a database
+that existed but had no schema — the version guard correctly refused to start,
+and nothing in the logs pointed at the provisioning call that caused it.
+
+### Pool sizing is a real constraint
+
+Each workspace gets its own pool, so the total is `workspaces ×
+POSTGRES_POOL_MAX_PER_WORKSPACE`. PostgreSQL's default `max_connections` is 100.
+The default here is 4, not 10, and the integration suite runs serially for the
+same reason: forty pools opening at once exhaust the server, and that failure
+looks like a database fault rather than a resource-management one.

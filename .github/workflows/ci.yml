@@ -128,4 +128,9 @@ jobs:
             CREATE DATABASE "_shared" TEMPLATE paradigm_template;
           SQL
 
-          node --test test/integration/*.test.mjs
+          # Serial, not parallel. Each test provisions a database with its own
+          # pool, and PostgreSQL's 100-connection default does not survive
+          # forty pools opening at once. The failure looks like a database
+          # fault rather than a resource-management one, which is a miserable
+          # thing to debug.
+          node --test --test-concurrency=1 test/integration/*.test.mjs

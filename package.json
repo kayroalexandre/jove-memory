@@ -13,7 +13,7 @@
     "mcp": "node src/mcp/server.mjs",
     "migrate": "node src/store/migrate.mjs",
     "test": "node --test test/*.test.mjs",
-    "test:integration": "node --test test/integration/*.test.mjs",
+    "test:integration": "node scripts/run-integration.mjs",
     "test:all": "npm test && npm run test:integration",
     "lint": "node scripts/lint.mjs",
     "secret-scan": "node scripts/secret-scan.mjs",
