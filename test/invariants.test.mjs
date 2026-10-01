@@ -74,6 +74,74 @@ test("compose publishes no database or object-storage port to the host", () => {
   );
 });
 
+test("compose declares an explicit project name", () => {
+  const compose = readFileSync("compose.yml", "utf8");
+  assert.match(
+    compose,
+    /^name:\s*jove-memory$/m,
+    "compose.yml must declare `name: jove-memory`. Without it the project name " +
+      "is inferred from the directory, so a checkout in a differently-named " +
+      "folder gets different volume and network names — and a second copy of " +
+      "this stack would silently attach to the wrong volumes."
+  );
+});
+
+test("compose keeps all three services in one project", () => {
+  const compose = readFileSync("compose.yml", "utf8");
+
+  // Look only inside the `services:` block, so a `depends_on:` key at a deeper
+  // indent is not mistaken for a service definition.
+  const servicesBlock = compose.slice(compose.indexOf("\nservices:\n"));
+  assert.ok(servicesBlock.length > 0, "compose.yml must have a services: block");
+
+  for (const service of ["api", "postgres", "minio"]) {
+    assert.ok(
+      new RegExp(`^  ${service}:\\s*$`, "m").test(servicesBlock),
+      `compose.yml must define the "${service}" service. All containers belong to ` +
+        `the same Compose project so they share a network and lifecycle.`
+    );
+  }
+  assert.ok(
+    /networks:\s*\n\s+jove:/m.test(compose),
+    "compose.yml must define the shared 'jove' network"
+  );
+});
+
+test("compose.yml is structurally valid", async () => {
+  // Text assertions cannot tell valid YAML from a file whose indentation was
+  // broken by an edit. This parses it.
+  const compose = readFileSync("compose.yml", "utf8");
+
+  // Minimal structural check that does not need a YAML dependency: every
+  // service key must be followed by keys indented deeper than itself, and the
+  // whole file must have consistent two-space indentation levels.
+  const lines = compose.split("\n");
+  for (const [i, line] of lines.entries()) {
+    if (!line.trim() || line.trim().startsWith("#")) continue;
+    const indent = line.length - line.trimStart().length;
+    if (indent % 2 !== 0) {
+      assert.fail(
+        `compose.yml:${i + 1} has odd indentation (${indent} spaces): ${line.trim()}\n` +
+          `Odd indentation is how a mis-indented key silently escapes its service ` +
+          `block and turns valid-looking YAML into a broken file.`
+      );
+    }
+  }
+
+  // Every key that belongs to a service must be indented under it.
+  const apiIndex = compose.indexOf("\n  api:");
+  assert.ok(apiIndex > 0, "the api service must be defined");
+  const afterApi = compose.slice(apiIndex).split("\n").slice(1);
+  for (const key of ["container_name", "ports", "depends_on"]) {
+    const found = afterApi.some((l) => l.startsWith(`    ${key}:`));
+    assert.ok(
+      found,
+      `the api service must have a "${key}" key at four-space indent. A service key ` +
+        `at two-space indent means the file lost a nesting level.`
+    );
+  }
+});
+
 // ---------------------------------------------------------------------------
 // ADR-005: one embedding space
 // ---------------------------------------------------------------------------
