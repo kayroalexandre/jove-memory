@@ -1,9 +1,8 @@
 # jove-memory
-
-# Phase 4-8: node API, Postgres, MinIO. One compose project, all four containers together.
 #
-# Ports: only the API is published, bound to localhost.
-# Postgres and MinIO publish nothing — reachable only inside this network.
+# Four containers, one project. Postgres and MinIO publish no host ports:
+# they hold the user's memory content and media bytes, and are reachable only
+# from inside this network. See docs/SECURITY.md.
 
 name: jove-memory
 
@@ -12,6 +11,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    image: jove-memory-api:dev
     container_name: jove-api
     restart: unless-stopped
     ports:
@@ -31,16 +31,10 @@ services:
         condition: service_healthy
     networks:
       - jove
-    healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8888/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
 
   postgres:
-    # pgvector preinstalled. pg_search (ParadeDB) is added by the init script;
-    # the app falls back to tsvector+GIN if it is unavailable.
+    # pgvector preinstalled. pg_search (ParadeDB) is attempted by the init
+    # script; the application detects its absence and falls back to tsvector+GIN.
     image: pgvector/pgvector:pg18
     container_name: jove-postgres
     restart: unless-stopped
