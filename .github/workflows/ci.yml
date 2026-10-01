@@ -59,6 +59,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
       - name: Unit tests
         # No database, no network. Anything that needs either runs in the
         # integration job, and anything that needs a provider runs against
@@ -87,12 +90,42 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
       - name: Integration tests
         env:
           TEST_DATABASE_URL: postgres://paradigm:testpassword@localhost:5432/paradigm
+          # Provisioning a workspace creates a database from this template. The
+          # template carries the extensions, so it has to exist before any test
+          # runs — scripts/init-db.sh does this on a real volume.
+          POSTGRES_PASSWORD: testpassword
         run: |
-          if [ -d test/integration ]; then
-            node --test test/integration/*.test.mjs
-          else
-            echo "no integration tests yet (Phase 1 adds them)"
+          if [ ! -d test/integration ]; then
+            echo "no integration tests yet"
+            exit 0
           fi
+
+          # Wait for the service container to accept connections.
+          for i in $(seq 1 30); do
+            if pg_isready -h localhost -U paradigm -d paradigm >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+
+          # Create the template database the app provisions workspaces from,
+          # plus the _shared database that holds cross-workspace entity edges.
+          # scripts/init-db.sh does both on a real volume; a CI service container
+          # has no such entrypoint, so the setup is repeated here. When the two
+          # diverge, this block is the thing to update.
+          PGPASSWORD=testpassword psql -h localhost -U paradigm -d postgres -v ON_ERROR_STOP=1 <<'SQL'
+            CREATE DATABASE paradigm_template TEMPLATE template0;
+          SQL
+          PGPASSWORD=testpassword psql -h localhost -U paradigm -d paradigm_template -v ON_ERROR_STOP=1 <<'SQL'
+            CREATE EXTENSION IF NOT EXISTS vector;
+            CREATE EXTENSION IF NOT EXISTS pg_trgm;
+          SQL
+          PGPASSWORD=testpassword psql -h localhost -U paradigm -d postgres -v ON_ERROR_STOP=1 <<'SQL'
+            CREATE DATABASE "_shared" TEMPLATE paradigm_template;
+          SQL
+
+          node --test test/integration/*.test.mjs
