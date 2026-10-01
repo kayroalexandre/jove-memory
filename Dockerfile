@@ -1,7 +1,11 @@
 FROM node:22-alpine
 
-# No model weights, no ML runtime. This image is a Node process and nothing else.
-# The absence of onnxruntime and @huggingface/transformers is deliberate (ADR-009).
+# This image is a Node process and nothing else.
+#
+# No model weights, no ONNX runtime, no local transformer library. The whole
+# project treats local model inference as forbidden (ADR-009): embedding,
+# inference and decisions all go to cloud providers. Keeping the runtime out
+# means ~1.2 GB less disk and a materially smaller dependency attack surface.
 
 WORKDIR /app
 

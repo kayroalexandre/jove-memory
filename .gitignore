@@ -22,7 +22,7 @@ secrets/
 credentials.json
 service-account*.json
 
-# Local data
+# Local data — these hold memory content and must never reach a public repo
 data/
 *.sqlite
 *.sqlite3
@@ -30,10 +30,15 @@ data/
 *.sqlite-journal
 *.sqlite-wal
 *.sqlite-shm
+*.brain
+*.brain.gz
 pgdata/
+pgdata*/
 minio-data/
-.brain/
+miniodata/
+minio*/
 snapshots/
+migrations-local/
 
 # Test and coverage
 coverage/
