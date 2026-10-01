@@ -90,4 +90,9 @@ jobs:
       - name: Integration tests
         env:
           TEST_DATABASE_URL: postgres://paradigm:testpassword@localhost:5432/paradigm
-        run: node --test test/integration/
+        run: |
+          if [ -d test/integration ]; then
+            node --test test/integration/*.test.mjs
+          else
+            echo "no integration tests yet (Phase 1 adds them)"
+          fi
