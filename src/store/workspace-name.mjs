@@ -33,9 +33,13 @@ export function isSharedWorkspace(name) {
 
 export function isValidWorkspaceName(name) {
   if (typeof name !== "string") return false;
-  if (name !== SHARED_WORKSPACE && !SAFE_NAME.test(name)) return false;
   if (RESERVED.has(name)) return false;
-  return true;
+  // Exactly one underscore-prefixed name is valid: the shared database. Any
+  // other leading underscore is a user name that happens to look internal,
+  // and allowing it would mean two ways to address the infrastructure.
+  if (name === SHARED_WORKSPACE) return true;
+  if (name.startsWith("_")) return false;
+  return SAFE_NAME.test(name);
 }
 
 export class WorkspaceNameError extends Error {
@@ -59,13 +63,21 @@ export function assertWorkspaceName(name) {
     throw new WorkspaceNameError(name, "it is longer than 63 characters");
   }
   // The shared database is infrastructure, not a user-named workspace, so it is
-  // exempt from the leading-letter rule. Everything else must be a plain
-  // unquoted identifier.
-  if (name !== SHARED_WORKSPACE && !SAFE_NAME.test(name)) {
-    throw new WorkspaceNameError(
-      name,
-      "it contains characters outside [a-z0-9_] or does not start with a letter"
-    );
+  // exempt from the leading-letter rule. Any other leading underscore is
+  // rejected: reserved-looking names belong to the system, not to a user.
+  if (name !== SHARED_WORKSPACE) {
+    if (name.startsWith("_")) {
+      throw new WorkspaceNameError(
+        name,
+        `names starting with an underscore are reserved for system databases (only "${SHARED_WORKSPACE}" is allowed)`
+      );
+    }
+    if (!SAFE_NAME.test(name)) {
+      throw new WorkspaceNameError(
+        name,
+        "it contains characters outside [a-z0-9_] or does not start with a letter"
+      );
+    }
   }
   if (RESERVED.has(name)) {
     throw new WorkspaceNameError(name, `it is reserved (${[...RESERVED].join(", ")})`);

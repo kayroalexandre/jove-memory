@@ -511,17 +511,28 @@ test("workspaces do not see each other's data", async () => {
 
 test("the shared workspace is a distinct database", async () => {
   const { store } = await provisionTracked("shared");
-    // `_shared` is created by scripts/init-db.sh, not by a workspace
-    // provisioning call — it is infrastructure, not a user-named workspace.
-    const all = await pools.listWorkspaces({ includeSystem: true });
-    assert.ok(
-      all.includes("_shared"),
-      `the _shared database must exist. Found: ${all.join(", ")}. ` +
-        `scripts/init-db.sh creates it on first start of the Postgres volume.`
-    );
-    // And it is distinguishable from an ordinary workspace.
-    assert.ok(isValidWorkspaceName("_shared"));
-    assert.throws(() => assertWorkspaceName("template1"), WorkspaceNameError);
+
+  // `_shared` is created by scripts/init-db.sh, not by a workspace
+  // provisioning call — it is infrastructure, not a user-named workspace.
+  // This test creates it when absent, so it does not depend on the caller
+  // having run the init script. A test that fails because the environment was
+  // not prepared reports the wrong problem.
+  let all = await pools.listWorkspaces({ includeSystem: true });
+  if (!all.includes("_shared")) {
+    await pools.provisionWorkspace("_shared");
+    all = await pools.listWorkspaces({ includeSystem: true });
+  }
+
+  assert.ok(
+    all.includes("_shared"),
+    `the _shared database must exist. Found: ${all.join(", ")}`
+  );
+
+  // Distinguishable from an ordinary workspace: valid as infrastructure, and
+  // impossible to confuse with a user-supplied name.
+  assert.ok(isValidWorkspaceName("_shared"));
+  assert.throws(() => assertWorkspaceName("template1"), WorkspaceNameError);
+  assert.throws(() => assertWorkspaceName("_other"), WorkspaceNameError);
 });
 
 test("workspace names are validated before they reach SQL", () => {

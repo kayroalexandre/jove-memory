@@ -112,13 +112,20 @@ jobs:
             sleep 1
           done
 
-          # Create the template database the app provisions workspaces from.
+          # Create the template database the app provisions workspaces from,
+          # plus the _shared database that holds cross-workspace entity edges.
+          # scripts/init-db.sh does both on a real volume; a CI service container
+          # has no such entrypoint, so the setup is repeated here. When the two
+          # diverge, this block is the thing to update.
           PGPASSWORD=testpassword psql -h localhost -U paradigm -d postgres -v ON_ERROR_STOP=1 <<'SQL'
             CREATE DATABASE paradigm_template TEMPLATE template0;
           SQL
           PGPASSWORD=testpassword psql -h localhost -U paradigm -d paradigm_template -v ON_ERROR_STOP=1 <<'SQL'
             CREATE EXTENSION IF NOT EXISTS vector;
             CREATE EXTENSION IF NOT EXISTS pg_trgm;
+          SQL
+          PGPASSWORD=testpassword psql -h localhost -U paradigm -d postgres -v ON_ERROR_STOP=1 <<'SQL'
+            CREATE DATABASE "_shared" TEMPLATE paradigm_template;
           SQL
 
           node --test test/integration/*.test.mjs
