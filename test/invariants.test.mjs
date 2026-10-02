@@ -266,7 +266,7 @@ test("only the store directory writes SQL", () => {
       if (path.startsWith(join("src", "store"))) continue;
 
       const content = readFileSync(path, "utf8");
-      if (/\b(SELECT|INSERT INTO|UPDATE\s+\w+\s+SET|DELETE FROM)\b/.test(content)) {
+      if (/\b(SELECT|INSERT INTO|UPDATE\s+\w+\s+SET|DELETE FROM|CREATE TABLE)\b/.test(content)) {
         offenders.push(path);
         continue;
       }
@@ -469,6 +469,87 @@ test("the width check happens before anything is written", () => {
     /Number\.isFinite/,
     "a NaN or Infinity in a vector produces one that matches nothing, silently"
   );
+});
+
+test("the settings form cannot leak the credential anywhere", () => {
+  // Three separate places, each of which has been the answer to "where did the
+  // key end up" in some incident or near-miss:
+  //
+  //   the page     — must load nothing external, or it has handed the key to a
+  //                  CDN. Must not be able to display what it stored.
+  //   the response — no endpoint returns a value, because a settings page that
+  //                  can display a secret is one that puts it in a screenshot.
+  //   the database — asserted against a live connection in the integration
+  //                  suite, because "the query that reaches the database does
+  //                  not carry the value" is a claim about the wire.
+  const page = readFileSync("src/api/settings-page.mjs", "utf8");
+  assert.equal(/<script[^>]+src=/i.test(page), false, "no external script");
+  assert.equal(/<link[^>]+href=/i.test(page), false, "no external stylesheet or icon");
+  assert.equal(/https?:\/\//i.test(page), false, "no absolute URL");
+  assert.match(page, /type="password"/, "and the field is not shoulder-readable");
+
+  // The server must not build a response containing the value. Checked by
+  // shape: a response field named for the secret is the thing to catch.
+  const server = stripComments(readFileSync("src/api/server.mjs", "utf8"));
+  assert.equal(
+    /\bvalue:\s*(body|req|value)\b/.test(server),
+    false,
+    "a credential response must not echo the submitted value"
+  );
+  // And the value must be cleared from the object it arrived in, so a later
+  // `logger.error({ ...body })` cannot pick it up.
+  assert.match(server, /value\.trim\(\)/, "the value is read out of the body explicitly");
+});
+
+test("the master key is not in the database and not in the repository", () => {
+  // The property the whole scheme turns on. If the master key were in the
+  // database, the encryption would be formatting: a dump would carry a
+  // credential.
+  const credentials = readFileSync("src/api/credentials.mjs", "utf8");
+
+  assert.match(
+    credentials,
+    /JOVE_MASTER_KEY_FILE/,
+    "the master key path must be overridable, and default outside the repository"
+  );
+  // The master key bytes must never cross into the store. The store takes
+  // opaque Buffers — that is the whole contract — and the master key is not
+  // one of them.
+  for (const call of stripComments(credentials).matchAll(/store\.[a-zA-Z]+\(([^)]*)\)/g)) {
+    assert.equal(
+      /masterKey|\.key\b/.test(call[1]),
+      false,
+      `the master key reached the store: store.${call[0].slice(6, call[0].indexOf("("))}`
+    );
+  }
+
+  // No hardcoded key material anywhere in src/.
+  for (const key of readdirSync("src", { recursive: true })) {
+    if (!String(key).endsWith(".mjs")) continue;
+    const content = readFileSync(join("src", String(key)), "utf8");
+    assert.equal(
+      /["'`]sk-or-v1-[A-Za-z0-9_-]{16,}["'`]/.test(content),
+      false,
+      `src/${key} contains a literal key`
+    );
+  }
+});
+
+test("the credential path never reaches a log line", () => {
+  // A credential that reaches a log reaches a CI log, a log aggregator, and
+  // every backup of both. The logger's redaction is keyed on field *names*,
+  // so a field called `value` is not covered by it — which is why the value
+  // must never be passed to the logger at all.
+  const server = stripComments(readFileSync("src/api/server.mjs", "utf8"));
+
+  for (const match of server.matchAll(/logger\.(error|warn|info|debug)\(([^;]*?)\);/g)) {
+    const call = match[2];
+    assert.equal(
+      /\bvalue\b(?!\s*:)/i.test(call),
+      false,
+      `a logger call may pass a key or a ` + `value-shaped field: ${call.slice(0, 120)}`
+    );
+  }
 });
 
 test("the absence of an ANN index is documented, not silent", () => {

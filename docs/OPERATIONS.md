@@ -611,3 +611,65 @@ Nothing in the repository, the database or a log ever received it. The exposure 
 the output of one diagnostic, not a persisted file — but the honest response to a
 credential appearing in output is to replace it, not to reason about how unlikely
 exposure is.
+
+---
+
+## Saving the key from the browser
+
+```bash
+docker compose up -d
+# then open http://127.0.0.1:8888/settings
+```
+
+Paste the key, press **Verify and save**. The form checks it against OpenRouter first, so
+a wrong key is reported *there* rather than by a failed search twenty minutes later.
+
+- **Verify and save** — checked against the provider, then stored.
+- **Save without verifying** — stored without a round trip. Used when the provider is
+  unreachable, which is a different situation from the key being wrong.
+- **Remove** — deletes the ciphertext. The audit trail stays.
+
+The field is write-only. After saving, the page shows a fingerprint of the ciphertext and
+nothing else — no last four, no masked value, no way to read it back. That is deliberate: a
+settings page that can display a secret is a settings page that puts it in a screenshot.
+
+### The command line is still there
+
+`npm run key:set` and `npm run key:check` still work, and are the right tools for CI and
+for a headless machine. The form is the right tool for a laptop.
+
+Both paths end at the same place: the form writes to the database, the CLI writes the file
+the container mounts. `OPENROUTER_API_KEY_FILE` takes precedence over the database, so a
+machine with a key file ignores whatever the form holds.
+
+### Where the master key is
+
+Two different secrets in two different places, and the split is the security property:
+
+| What | Where | Mode |
+| --- | --- | --- |
+| Your OpenRouter key | the database, encrypted | AES-256-GCM |
+| The key that encrypts it | a host file, bind-mounted read-only into the container | 600 |
+
+```
+$ curl -s localhost:8888/v1/settings/credentials | jq .masterKeyPath
+"/var/lib/jove/keys/master.key"
+```
+
+That is a container path. On the host it is `${JOVE_SECRETS_DIR}/master/master.key`, and
+`npm run key:set` creates that directory.
+
+**Losing the master key makes every stored credential undecryptable.** The same as losing
+the ciphertext, from the other direction. Back it up somewhere that is not the database.
+
+### Why the container is not given write access to your key
+
+The credential mount is `read_only: true`. The container genuinely needs to write the
+master key once, into a different directory it owns, and genuinely must not be able to
+rewrite the credential it protects. Mounting both read-write would have been simpler and
+wrong.
+
+A named Docker volume was tried first and does not work: Docker creates one owned by
+root, and the container runs as the host user so it can read a mode-600 file — so it
+cannot write its own key into it either. A host directory `npm run key:set` creates and
+owns is the arrangement that works without an entrypoint running as root.

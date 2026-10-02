@@ -31,6 +31,20 @@ export const RESERVED = new Set(["postgres", "template0", "template1", "paradigm
  */
 export const INFRASTRUCTURE_DATABASES = new Set(["paradigm", "paradigm_template"]);
 
+/**
+ * The workspace the service is "about" when nothing else is specified.
+ *
+ * Used for the settings credential, which is per-workspace like every other
+ * piece of state (ADR-003). A key configured for `main` is not configured for
+ * every workspace, and that is deliberate: it is the same rule that keeps one
+ * workspace's memories out of another's searches, applied to a secret rather
+ * than to a memory.
+ *
+ * Overridable with `JOVE_WORKSPACE` for a deployment that is about a different
+ * workspace.
+ */
+export const DEFAULT_WORKSPACE = "main";
+
 export function isInfrastructureDatabase(name) {
   return INFRASTRUCTURE_DATABASES.has(name);
 }

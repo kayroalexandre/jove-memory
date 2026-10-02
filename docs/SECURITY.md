@@ -115,3 +115,72 @@ substantially, which is a side benefit of the no-local-models decision.
 
 Do not open a public issue for a vulnerability. Use GitHub's private vulnerability reporting
 on this repository.
+
+---
+
+## The credential at rest
+
+The settings form at `/settings` writes the OpenRouter key into the database. It is stored
+**encrypted**, and the property that makes the encryption mean something is this:
+
+> **The key that encrypts the credential is not in the database.**
+
+| Half | Where | Who controls it | Exposure |
+| --- | --- | --- | --- |
+| Ciphertext, nonce, auth tag | `provider_credentials` in the workspace database | this application | reachable from the container network; no host port |
+| Master key | a 32-byte file, mode 600, outside the repository | the operator | not mounted read-only into anything |
+
+Consequences, stated plainly:
+
+- A database backup, a replica, or a `pg_dump` pasted into an issue yields **ciphertext**.
+- The master key file alone yields **nothing usable** — it is a key, not a credential.
+- An attacker with **both** recovers the key. No single-place encryption changes that, and
+  this document does not claim otherwise.
+
+### Why AES-256-GCM
+
+Because of the authentication tag. CBC under a wrong key produces garbage that decrypts
+"successfully", and that garbage is then sent to a provider as an API key. GCM refuses: a
+tampered row, a corrupted byte, or a replaced master key is an error at the first
+decryption.
+
+### Why the fingerprint is keyed
+
+`credentials_audit` and `provider_credentials` carry a 16-character fingerprint used to
+answer "is this the same key as before?". It is an **HMAC of the value under the master
+key**, not a hash of the value and not a hash of the ciphertext:
+
+- A hash of the value would let anyone holding the database test candidate keys against
+  it. With the master key as the HMAC key, they cannot — and if they have the master key
+  they can decrypt outright, so the fingerprint adds nothing they did not already have.
+- A hash of the ciphertext changes on every save, because GCM uses a fresh nonce per
+  write. That makes "unchanged" unreachable, so the form would report a change every time
+  an unchanged key was saved, and a report that is always "changed" is a report nobody
+  reads.
+
+### What is deliberately absent
+
+- **No last-four field.** Four characters narrows a key space further than it feels like,
+  and nothing here needs it that a fingerprint does not serve.
+- **No diff in the audit trail.** A diff of two keys is not reconstructible and is a leak
+  waiting for a use case. Operations and timestamps only.
+- **Nothing external on the page.** No script, stylesheet, font, icon or analytics from
+  any origin, enforced by a `default-src 'none'` CSP rather than asserted in a comment.
+  A page that accepts a credential and loads a script from a CDN has handed that
+  credential to the CDN.
+- **No way to read the key back.** The form is write-only. After saving, the field is
+  cleared and the response carries a fingerprint. A settings page that can display a
+  secret is a settings page that puts it in a screenshot.
+
+### What is not protected
+
+- An attacker who can read the database **and** the filesystem as the operating user.
+- A compromised host. At that point the key is recoverable.
+- The master key in a `pg_dump` — it is not there, which is the point.
+
+### Per-workspace
+
+Credentials are per-workspace like everything else (ADR-003). A key saved from the
+settings form lives in the workspace the service was started for, and is not visible from
+another. That is the same rule that keeps one workspace's memories out of another's
+searches, applied to a secret rather than to a memory.
