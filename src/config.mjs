@@ -244,6 +244,27 @@ export function providerSection(env = process.env) {
   };
 }
 
+/**
+ * The thresholds, resolvable without a database credential.
+ *
+ * Split out for the same reason as `providerSection`: `npm run gate:measure`
+ * calibrates a threshold and needs no database, and requiring a database
+ * password to measure one is a coupling with no purpose. The first version
+ * called `loadConfig()` and died on `POSTGRES_PASSWORD is not set` while
+ * holding a perfectly good key and a working script.
+ *
+ * These are starting values, not measured ones. See docs/THRESHOLDS.md.
+ */
+export function thresholdSection(env = process.env) {
+  return {
+    thresholds: {
+      writeGate: Number(optional("PARADIGM_THRESHOLD_WRITE_GATE", "0.60")),
+      rerank: Number(optional("PARADIGM_THRESHOLD_RERANK", "0.60")),
+      crossWorkspace: Number(optional("PARADIGM_THRESHOLD_CROSS_WORKSPACE", "0.75"))
+    }
+  };
+}
+
 /** Provider configuration alone, with no other credential required. */
 export function loadProviderConfig(env = process.env) {
   return providerSection(env);
@@ -289,13 +310,7 @@ export function loadConfig(env = process.env) {
 
       ...providerSection(env),
 
-      thresholds: {
-        // Starting values, not final ones. These get measured, not trusted.
-        // See docs/THRESHOLDS.md.
-        writeGate: Number(optional("PARADIGM_THRESHOLD_WRITE_GATE", "0.60")),
-        rerank: Number(optional("PARADIGM_THRESHOLD_RERANK", "0.60")),
-        crossWorkspace: Number(optional("PARADIGM_THRESHOLD_CROSS_WORKSPACE", "0.75"))
-      },
+      ...thresholdSection(env),
     };
   } finally {
     if (env !== previous) process.env = previous;
