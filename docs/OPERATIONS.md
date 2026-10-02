@@ -437,3 +437,92 @@ same variable, so the container follows.
 same directory, then renamed — so an interrupted save cannot leave a truncated
 key that looks valid. A failed save leaves the previous key in place: clearing a
 working key is the one outcome worse than the one already there.
+
+---
+
+## What went wrong the first time, and the two rules that came out of it
+
+`npm run key:set` failed with:
+
+```
+Error: EPERM: operation not permitted, chmod '/home/kayro/.config/jove-memory'
+```
+
+`~/.config/jove-memory` already existed, **owned by root**, mode 755. The script called
+`mkdirSync(..., { recursive: true })`, which succeeds silently when the directory is
+already there, and then called `chmod` on a directory it does not own — which throws.
+The user had already pasted a key by then, and had to paste it again.
+
+### Rule 1: choose the location before asking for the secret
+
+A setup script that requests a secret and then fails to save it has made the user type
+their password into a void. The directory is now chosen first, by asking two questions
+of each candidate:
+
+- do we own it?
+- can we make it private, and is it private afterwards?
+
+Candidates, in order: `$JOVE_SECRETS_DIR`, `~/.config/jove-memory`,
+`~/.local/share/jove-memory`, `~/.jove-memory`. The first two that pass both questions
+win. If `JOVE_SECRETS_DIR` is set it is honoured or refused — never silently replaced,
+because the health endpoint reports the path and a key in an unexpected place is
+visible only late.
+
+`~/.config/jove-memory` being root-owned here is itself worth fixing:
+
+```bash
+sudo chown "$(id -u):$(id -g)" ~/.config/jove-memory
+```
+
+Or skip it: the script will use `~/.local/share/jove-memory` and tell you the
+`export` line the container needs.
+
+### Rule 2: verify the permissions, and delete the file if they are wrong
+
+This is the one that matters, and the ordering is the whole design:
+
+1. write to a temp file in the same directory, **mode 600 at creation**
+2. `rename` over the target — atomic, so an interrupted save cannot leave a truncated
+   key that looks valid
+3. `chmod` the directory to 700
+4. **read the mode back**
+5. if the file is still readable by another account, **delete it and fail**
+
+Step 5 is the one that is easy to omit. A `chmod` that fails *silently* — a filesystem
+mounted without mode support, a directory owned by another user, a container running as
+a different user — leaves a credential every account on the machine can read, and the
+process exits 0 having reported success.
+
+Step 1 is mode-at-creation rather than chmod-after, because a file created `644` is
+readable by other accounts for the entire window between `open` and `chmod`. That window
+is the only reason to pass the mode to `open`.
+
+The checks are in `scripts/lib/secure-file.mjs`, and they are tested with injected
+failures rather than by reproducing them — the real conditions need root, or a
+filesystem without mode support, and neither is something a test suite should arrange.
+
+## Three bugs the tests for that fix caught
+
+**`realOps` was incomplete.** The injectable filesystem object left out `openSync`, so
+*every real write* threw `ops.openSync is not a function`. Every test that exercised an
+interesting failure injected its own operations and passed, so a module that could not
+write a file at all had a green suite. There is now a test that writes through the
+default path, and a structural test that no filesystem call in the module bypasses `ops`.
+
+**A test fixture hung the whole file.** `secureDirectory("/proc/cannot/create/this")` —
+`mkdir` on that filesystem does not return in this environment. The file timed out and
+the other eighteen tests stopped reporting. A fixture that hangs is worse than one that
+fails. Replaced with a path whose parent is a regular file, which fails instantly with
+`ENOTDIR`.
+
+**The leak detector was vacuous.** The test asserting the key never reaches output read
+"no `out()` call mentions the word key" — which the script's own prompts fail, so it was
+loosened until it passed and the property went untested. It now strips string literals
+and template text before looking for the identifier, so `out("paste the key")` and
+`out(key)` are distinguishable.
+
+Stripping template literals then needed care: `${key}` has to survive the strip or a
+real leak becomes invisible. The first version got the marker pairing wrong and lost
+the interpolation anyway. A **negative control** now feeds five real leaks and three
+clean snippets through the same detector, so a detector that goes blind fails a test
+instead of quietly approving.
