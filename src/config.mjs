@@ -71,10 +71,17 @@ function assertOutsideRepository(path) {
 export function keyDirectoryCandidates(env = process.env) {
   if (env.JOVE_SECRETS_DIR) return [env.JOVE_SECRETS_DIR];
 
+  // `env.HOME` first, not `os.homedir()`. os.homedir() reads the process
+  // environment, so a caller passing an explicit environment — a test, or
+  // anything that wants a scratch home — would have it ignored, and the only
+  // way to test the fallback list would be to create directories in the real
+  // home directory as a side effect.
+  const home = env.HOME || homedir();
+
   return [
-    join(homedir(), ".config", "jove-memory"),
-    join(homedir(), ".local", "share", "jove-memory"),
-    join(homedir(), ".jove-memory")
+    join(home, ".config", "jove-memory"),
+    join(home, ".local", "share", "jove-memory"),
+    join(home, ".jove-memory")
   ];
 }
 

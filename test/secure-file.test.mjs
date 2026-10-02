@@ -60,17 +60,44 @@ test("a directory we own is accepted", () => {
 });
 
 test("a directory owned by another user is refused, and the reason names the owner", () => {
-  // The real failure. A directory root owns is not a place to put a
-  // credential, and reporting only "chmod failed" sends the reader to the
-  // wrong fix.
-  const rootOwned = secureDirectory("/home/kayro/.config/jove-memory");
-  if (rootOwned.usable) {
-    // It became ours between the report and this test. Nothing to assert, and
-    // pretending otherwise would be a test that fails for a good reason.
-    return;
-  }
-  assert.match(rootOwned.reason, /owned by uid|does not exist/);
-  assert.equal(rootOwned.owned, false);
+  // Simulated rather than probed at a real path. The original version pointed
+  // at `/home/kayro/.config/jove-memory`, which is what failed here — and which
+  // does not exist on a CI runner at all, so the same test asserted
+  // "cannot create it" in CI and "owned by uid 0" on this machine. A test
+  // whose assertion depends on whose machine it runs on is a test about the
+  // machine.
+  const dir = scratch();
+  const target = join(dir, "secrets");
+  mkdirSync(target, { recursive: true });
+
+  const verdict = secureDirectory(target, {
+    ...realOps,
+    statSync: (path) => ({ ...realOps.statSync(path), uid: process.getuid() + 4242 })
+  });
+
+  assert.equal(verdict.usable, false);
+  assert.equal(verdict.owned, false);
+  assert.match(
+    verdict.reason,
+    /owned by uid \d+, not by this user/,
+    "the reason must name the owner — 'chmod failed' sends the reader to the wrong fix"
+  );
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("a real unusable directory is refused, whatever the reason", () => {
+  // The machine-dependent half, kept deliberately weak. The property that
+  // matters is "refused, and says why", not which of the several reasons
+  // applies on the day. Asserting a specific message here is what made the
+  // previous version of this test pass on one machine and fail on another.
+  const dir = scratch();
+  const blocker = join(dir, "a-file");
+  writeFileSync(blocker, "not a directory");
+
+  const verdict = secureDirectory(join(blocker, "secrets"));
+  assert.equal(verdict.usable, false);
+  assert.ok(verdict.reason && verdict.reason.length > 10, `unhelpful reason: ${verdict.reason}`);
+  rmSync(dir, { recursive: true, force: true });
 });
 
 test("a directory that cannot be created is refused, not thrown from", () => {
@@ -325,14 +352,25 @@ test("the setup script and the config module agree on where a key may live", () 
   );
 });
 
-test("the fallback directories include one that exists on this machine", () => {
-  // ~/.config/jove-memory is root-owned here, so the list has to have somewhere
-  // else to go — and it has to be somewhere this user can actually secure.
-  const candidates = keyDirectoryCandidates({});
-  assert.ok(candidates.length >= 2, "there must be a fallback");
+test("at least one fallback directory is usable, whatever the machine looks like", () => {
+  // The property that matters: the list is never a dead end. On this machine
+  // `~/.config/jove-memory` is root-owned, which is exactly why the fallbacks
+  // exist.
+  //
+  // Run against a scratch HOME. The earlier version probed the real home
+  // directory, which meant the suite *created* directories in it as a side
+  // effect, and its result depended on whose account ran it.
+  const home = scratch();
+  const candidates = keyDirectoryCandidates({ HOME: home });
+  assert.ok(candidates.length >= 2, "there must be a fallback at all");
 
   const usable = candidates.filter((dir) => secureDirectory(dir).usable);
   assert.ok(usable.length > 0, `no usable candidate among: ${candidates.join(", ")}`);
+  assert.ok(
+    candidates.every((dir) => dir.startsWith(home)),
+    "and every candidate is under the home directory, never the project"
+  );
+  rmSync(home, { recursive: true, force: true });
 });
 
 test("JOVE_SECRETS_DIR replaces the list rather than joining it", () => {
