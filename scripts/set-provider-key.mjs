@@ -172,6 +172,28 @@ function reportNoUsableDirectory(rejected, explicit) {
   process.exit(1);
 }
 
+/**
+ * Create the directory the master key lives in.
+ *
+ * Made here, owned by this user, mode 700 — because the container cannot do it.
+ * The container runs as the host user so it can read a mode-600 credential, so
+ * when it starts and the master key directory does not exist it has no way to
+ * create it. A named volume would have been tidier, but Docker creates those
+ * owned by root, which the container cannot write to either.
+ */
+function ensureMasterKeyDirectory(dir) {
+  const masterDir = join(dir, "master");
+  const verdict = secureDirectory(masterDir);
+  if (!verdict.usable) {
+    out(
+      `\n  Could not prepare the master key directory ${masterDir}: ${verdict.reason}\n` +
+        "  The settings form cannot encrypt anything without it.\n\n"
+    );
+    process.exit(1);
+  }
+  return masterDir;
+}
+
 function describeExisting(dir) {
   const file = join(dir, FILE_NAME);
   if (!existsSync(file)) return "not set";
@@ -208,6 +230,8 @@ out("\n");
 out("  the key is read with echo off and is never printed, logged, or\n");
 out("  written inside the repository. Nothing is sent over the network.\n\n");
 out(`  current    ${describeExisting(dir)}\n\n`);
+const masterDir = ensureMasterKeyDirectory(dir);
+
 out("  Paste the key and press enter (nothing will be shown): ");
 
 process.stdin.setRawMode?.(false);
@@ -243,6 +267,7 @@ for (let attempt = 1; attempt <= 3; attempt += 1) {
 
     out("  Next:\n");
     out("    npm run key:check      verifies it against the live API\n");
+    out(`    ${masterDir}          ready for the encryption key\n`);
     out("\n");
     process.exit(0);
   } catch (err) {

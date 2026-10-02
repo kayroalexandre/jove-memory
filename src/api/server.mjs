@@ -5,8 +5,10 @@ import { createLogger } from "../logger.mjs";
 import { createPoolManager } from "../store/pool.mjs";
 import { createStore } from "../store/store.mjs";
 import { assertSchemaVersion, expectedVersion } from "../store/migrate.mjs";
-import { SHARED_WORKSPACE } from "../store/workspace-name.mjs";
+import { SHARED_WORKSPACE, DEFAULT_WORKSPACE } from "../store/workspace-name.mjs";
 import { createEmbedder } from "../embedding/openrouter.mjs";
+import { createCredentialStore } from "./credentials.mjs";
+import { settingsPage } from "./settings-page.mjs";
 
 /**
  * HTTP server: health and the workspace registry.
@@ -53,7 +55,16 @@ if (!embedder) {
  * build without a key, and the health endpoint has to work there — which is
  * the same reasoning as the health check making no outbound request.
  */
-export function createApp({ config, logger, pools, embedder = null, keySource = null }) {
+export function createApp({
+  config,
+  logger,
+  pools,
+  embedder = null,
+  keySource = null,
+  credentials = null,
+  store = null,
+  buildEmbedder = null
+}) {
   async function checkPostgres() {
     try {
       const workspaces = await pools.listWorkspaces({ includeInfrastructure: true });
@@ -229,8 +240,149 @@ export function createApp({ config, logger, pools, embedder = null, keySource = 
     return { ...stats, capabilities, health };
   }
 
-  return { handleHealth, handleWorkspaces, handleWorkspaceStats };
+  // ---------------------------------------------------------------------------
+  // Settings
+  // ---------------------------------------------------------------------------
+
+  /**
+   * The current state of a credential, with no value in it.
+   *
+   * `configured: false` rather than a 404. "No key" is a normal state that the
+   * page has to render, not an error.
+   */
+  async function handleCredentialState({ provider = "openrouter", kind = "api_key" } = {}) {
+    if (!credentials) {
+      return {
+        credential: null,
+        error: "credentials are not available in this build"
+      };
+    }
+    return {
+      credential: await credentials.describe({ provider, kind }),
+      masterKeyPath: credentials.masterKeyPath(),
+      masterKeyCreated: credentials.masterKeyCreated()
+    };
+  }
+
+  /**
+   * Store, verify or clear a credential.
+   *
+   * The body is read with a hard size cap. A settings endpoint that accepts an
+   * unbounded body is a memory-exhaustion target, and this one is on a port
+   * bound to loopback, where "who could reach it" is a question worth asking
+   * anyway.
+   *
+   * The value is never logged, never echoed, and never included in an error
+   * message. The `value` field is read out of the body and the body is dropped
+   * immediately after.
+   */
+  async function handleCredentialWrite(body) {
+    if (!credentials) throw new Error("credentials are not available in this build");
+
+    const action = body?.action ?? "save";
+    const provider = body?.provider ?? "openrouter";
+    const kind = body?.kind ?? "api_key";
+
+    if (action === "clear") {
+      const removed = await credentials.clear({ provider, kind, note: body?.note ?? null });
+      return {
+        ok: true,
+        removed,
+        credential: await credentials.describe({ provider, kind }),
+        message: removed
+          ? "Removed. Retrieval runs on three layers until a key is set again."
+          : "There was no key to remove."
+      };
+    }
+
+    const value = typeof body?.value === "string" ? body.value : "";
+    if (value.trim() === "") {
+      // 400 with a message the form can show. The value is absent, so there is
+      // nothing to leak.
+      return { ok: false, status: 400, detail: "paste a key first" };
+    }
+
+    // Verified before stored, not after. The point of the form is that the
+    // operator learns a key is wrong here rather than from a failed search
+    // twenty minutes later.
+    if (action === "verify") {
+      // The candidate key, not the configured one. Verifying the old key
+      // while testing the new one is a check that always passes.
+      //
+      // Injectable so a test can drive this without a network call. The first
+      // version built the client inline and ignored whatever the caller
+      // supplied, so a test asserting "a rejected key is not stored" made a
+      // real request to OpenRouter on every run — spending money and
+      // depending on a third party's mood for a storage property.
+      //
+      // `undefined` means "not supplied, build the real one"; an explicit
+      // `null` means "there is no client", which is a state worth testing
+      // because it is what a keyless deployment is in. `??` conflates the two,
+      // and did, so the not-configured path was unreachable.
+      const makeEmbedder =
+        buildEmbedder === undefined
+          ? (candidate) =>
+              createEmbedder({
+                config: { ...config, providers: { ...config.providers, apiKey: candidate } },
+                logger
+              })
+          : buildEmbedder;
+
+      const check = await credentials.verify({
+        value,
+        buildEmbedder: makeEmbedder,
+        dimensions: config.embedding.dimensions
+      });
+
+      if (check.ok === null) {
+        // Unverifiable, not wrong. Storing anyway is the right call and saying
+        // so is the important part.
+        const saved = await credentials.set({ provider, kind, value, note: "stored without verification" });
+        return {
+          ok: true,
+          verified: false,
+          credential: saved,
+          // Short, and says the thing that matters. The first version appended
+          // the reason twice over and read like a sentence assembled by parts.
+          message: `Saved, but not verified: ${check.detail}.`
+        };
+      }
+
+      if (!check.ok) {
+        // Nothing is stored. A rejected key must not land in the table as a
+        // fallback that something else picks up later.
+        return { ok: false, status: 400, reason: check.reason, detail: check.detail };
+      }
+    }
+
+    const saved = await credentials.set({ provider, kind, value });
+    return {
+      ok: true,
+      credential: saved,
+      message: saved.changed
+        ? "Saved. The key is encrypted and will never be shown again."
+        : "Unchanged — that is the same key already stored."
+    };
+  }
+
+  return {
+    handleHealth,
+    handleWorkspaces,
+    handleWorkspaceStats,
+    handleCredentialState,
+    handleCredentialWrite
+  };
 }
+
+/**
+ * Body size cap for the settings endpoint.
+ *
+ * 8 KiB is about four hundred times a key. A settings endpoint that accepts an
+ * unbounded body is a memory-exhaustion target, and this one is on a port
+ * bound to loopback — where "who could reach it" deserves the same question as
+ * anywhere else.
+ */
+const MAX_BODY_BYTES = 8 * 1024;
 
 function send(res, status, body) {
   const payload = JSON.stringify(body, null, 2);
@@ -243,8 +395,94 @@ function send(res, status, body) {
   res.end(payload);
 }
 
-export function createHttpServer({ config, logger, pools, embedder = null, keySource = null }) {
-  const app = createApp({ config, logger, pools, embedder, keySource });
+/**
+ * HTML response.
+ *
+ * The security headers are the point of this function rather than an
+ * afterthought. A page that accepts a credential and serves it on loopback
+ * still deserves to say: no framing, no sniffing, no referrer.
+ */
+function sendHtml(res, status, html) {
+  res.writeHead(status, {
+    "content-type": "text/html; charset=utf-8",
+    "content-length": Buffer.byteLength(html),
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+    "x-frame-options": "DENY",
+    "referrer-policy": "no-referrer",
+    // The page loads nothing from anywhere. A CSP that says so makes that a
+    // property the browser enforces rather than a claim in a comment.
+    "content-security-policy":
+      "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+  });
+  res.end(html);
+}
+
+/**
+ * Read a JSON body, with a cap.
+ *
+ * The cap is enforced against the declared content-length *and* the actual
+ * bytes, because a lying header is the standard way past a length check.
+ */
+async function readJsonBody(req) {
+  const declared = Number(req.headers["content-length"] ?? 0);
+  if (declared > MAX_BODY_BYTES) {
+    throw Object.assign(new Error(`Request body exceeds ${MAX_BODY_BYTES} bytes`), { status: 413 });
+  }
+
+  const chunks = [];
+  let total = 0;
+
+  for await (const chunk of req) {
+    total += chunk.length;
+    if (total > MAX_BODY_BYTES) {
+      req.destroy();
+      throw Object.assign(new Error(`Request body exceeds ${MAX_BODY_BYTES} bytes`), { status: 413 });
+    }
+    chunks.push(chunk);
+  }
+
+  if (total === 0) return {};
+
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    throw Object.assign(new Error("Body is not valid JSON"), { status: 400 });
+  }
+}
+
+/** Drop undefined fields, so a response shape does not vary for no reason. */
+function stripUndefined(body) {
+  return Object.fromEntries(Object.entries(body).filter(([, value]) => value !== undefined));
+}
+
+export function createHttpServer({
+  config,
+  logger,
+  pools,
+  embedder = null,
+  keySource = null,
+  store = null,
+  credentials = null,
+  buildEmbedder = null
+}) {
+  // The credential store is per-workspace, like every other store, because
+  // one database per workspace is the design (ADR-003). A credential written
+  // into the `main` workspace is not visible from `geos`, which is the same
+  // rule that keeps one workspace's memories out of another's searches.
+  const credentialStore =
+    credentials ??
+    (store ? createCredentialStore({ store, logger }) : null);
+
+  const app = createApp({
+    config,
+    logger,
+    pools,
+    embedder,
+    keySource,
+    credentials: credentialStore,
+    buildEmbedder
+  });
 
   const server = createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host ?? "localhost"}`);
@@ -265,11 +503,27 @@ export function createHttpServer({ config, logger, pools, embedder = null, keySo
         return send(res, 200, await app.handleWorkspaceStats(statsMatch[1]));
       }
 
+      if (req.method === "GET" && url.pathname === "/settings") {
+        return sendHtml(res, 200, settingsPage());
+      }
+
+      if (req.method === "GET" && url.pathname === "/v1/settings/credentials") {
+        return send(res, 200, await app.handleCredentialState());
+      }
+
+      if (req.method === "POST" && url.pathname === "/v1/settings/credentials") {
+        const body = await readJsonBody(req);
+        const result = await app.handleCredentialWrite(body);
+        // 400 for a rejected key, 200 for anything accepted. The distinction
+        // matters: a rejected key is not stored, and the response says so.
+        return send(res, result.status ?? 200, stripUndefined(result));
+      }
+
       if (req.method === "GET" && url.pathname === "/") {
         return send(res, 200, {
           service: "jove-memory",
           phase: 4,
-          endpoints: ["/health", "/v1/workspaces"]
+          endpoints: ["/health", "/v1/workspaces", "/settings", "/v1/settings/credentials"]
         });
       }
 
@@ -284,7 +538,16 @@ export function createHttpServer({ config, logger, pools, embedder = null, keySo
         message: err.message,
         code: err.code ?? null
       });
-      send(res, 500, { error: "internal_error" });
+      // A status attached by a handler is the answer, not a fallback. The
+      // first version collapsed every failure to 500, so a 413 "body too
+      // large" and a 400 "malformed JSON" were indistinguishable to a client.
+      const status = Number.isInteger(err.status) && err.status >= 400 && err.status < 600
+        ? err.status
+        : 500;
+      send(res, status, {
+        error: status === 500 ? "internal_error" : "bad_request",
+        detail: status === 500 ? null : err.message
+      });
     } finally {
       logger.debug("request", {
         path: url.pathname,
@@ -298,8 +561,17 @@ export function createHttpServer({ config, logger, pools, embedder = null, keySo
 }
 
 /** Start the server and wire graceful shutdown. */
-export async function start({ config, logger, pools, embedder = null, keySource = null }) {
-  const server = createHttpServer({ config, logger, pools, embedder, keySource });
+export async function start({
+  config,
+  logger,
+  pools,
+  embedder = null,
+  keySource = null,
+  store = null,
+  credentials = null,
+  buildEmbedder = null
+}) {
+  const server = createHttpServer({ config, logger, pools, embedder, keySource, store, credentials });
 
   await new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -356,7 +628,25 @@ export async function start({ config, logger, pools, embedder = null, keySource 
 }
 
 async function main() {
-  const { server, shutdown } = await start({ config, logger, pools, embedder, keySource });
+  // Which workspace the settings form writes to.
+  //
+  // Credentials are per-workspace like everything else (ADR-003): a key stored
+  // in `main` is not visible from another workspace, which is the same rule
+  // that keeps one workspace's memories out of another's searches. It is a
+  // deliberate consequence — a key configured for one workspace is not a key
+  // configured for all of them.
+  const settingsWorkspace = process.env.JOVE_WORKSPACE ?? DEFAULT_WORKSPACE;
+  const store = createStore({ workspace: settingsWorkspace, pools, logger });
+
+  const { server, shutdown } = await start({
+    config,
+    logger,
+    pools,
+    embedder,
+    keySource,
+    store
+  });
+  logger.info("settings workspace", { workspace: settingsWorkspace });
   // Keep the process alive; the http server does that on its own, but an
   // unhandled rejection should not leave a half-dead container.
   process.on("unhandledRejection", (reason) => {

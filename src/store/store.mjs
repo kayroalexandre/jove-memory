@@ -1076,6 +1076,87 @@ export function createStore({ workspace, pools, logger = null, clock = () => new
     },
 
     // -----------------------------------------------------------------------
+    // Provider credentials
+    //
+    // The values are opaque bytes to this layer. Encryption happens in
+    // src/api/credentials.mjs, and the master key never reaches this file —
+    // which is what makes the invariant above enforceable: a module outside
+    // src/store/ cannot reach the ciphertext table, because reaching it means
+    // going through here.
+    // -----------------------------------------------------------------------
+
+    async upsertCredential({
+      provider,
+      kind,
+      ciphertext,
+      nonce,
+      authTag,
+      keyVersion,
+      fingerprint
+    }) {
+      await pools.poolFor(workspace).query(
+        `INSERT INTO provider_credentials
+           (provider, kind, ciphertext, nonce, auth_tag, key_version, ciphertext_fingerprint)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)
+         ON CONFLICT (provider, kind) DO UPDATE SET
+           ciphertext = EXCLUDED.ciphertext,
+           nonce = EXCLUDED.nonce,
+           auth_tag = EXCLUDED.auth_tag,
+           key_version = EXCLUDED.key_version,
+           ciphertext_fingerprint = EXCLUDED.ciphertext_fingerprint,
+           updated_at = now()`,
+        [provider, kind, ciphertext, nonce, authTag, keyVersion, fingerprint]
+      );
+    },
+
+    /** The sealed parts only. Never a decrypted value — that never lands here. */
+    async readCredential({ provider, kind }) {
+      const { rows } = await pools.poolFor(workspace).query(
+        `SELECT provider, kind, ciphertext, nonce, auth_tag, key_version
+         FROM provider_credentials WHERE provider = $1 AND kind = $2`,
+        [provider, kind]
+      );
+      return rows[0] ?? null;
+    },
+
+    async describeCredential({ provider, kind }) {
+      const { rows } = await pools.poolFor(workspace).query(
+        `SELECT provider, kind, key_version, ciphertext_fingerprint, created_at, updated_at
+         FROM provider_credentials WHERE provider = $1 AND kind = $2`,
+        [provider, kind]
+      );
+      return rows[0] ?? null;
+    },
+
+    async deleteCredential({ provider, kind }) {
+      const { rows } = await pools.poolFor(workspace).query(
+        "DELETE FROM provider_credentials WHERE provider = $1 AND kind = $2 RETURNING provider",
+        [provider, kind]
+      );
+      return rows.length > 0;
+    },
+
+    async recordCredentialAudit({ provider, kind, operation, note = null }) {
+      await pools.poolFor(workspace).query(
+        "INSERT INTO credentials_audit (provider, kind, operation, note) VALUES ($1,$2,$3,$4)",
+        [provider, kind, operation, note]
+      );
+    },
+
+    async listCredentialAudit({ provider = null, kind = null, limit = 50 } = {}) {
+      const { rows } = await pools.poolFor(workspace).query(
+        `SELECT at, provider, kind, operation, note
+         FROM credentials_audit
+         WHERE ($1::text IS NULL OR provider = $1)
+           AND ($2::text IS NULL OR kind = $2)
+         ORDER BY at DESC
+         LIMIT $3`,
+        [provider, kind, limit]
+      );
+      return rows;
+    },
+
+    // -----------------------------------------------------------------------
     // Search accounting
     // -----------------------------------------------------------------------
 
