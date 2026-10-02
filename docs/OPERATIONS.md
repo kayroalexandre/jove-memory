@@ -805,3 +805,105 @@ GATE MET
 
 The corruption test tampers with the stored object and leaves the recorded hash alone, which
 is exactly what real corruption produces, and asserts the read is refused.
+
+---
+
+## Phase 8: cross-workspace retrieval fails closed
+
+```
+gate: no edge means no crossing
+  [pass] a workspace cannot read another's items directly
+  [pass] nor from the other direction
+  [pass] nothing crosses with no edge
+  [pass] and the refusal is named                        failClosed: true
+  [pass] and the audit distinguishes looked-and-found-nothing from never-looked
+
+gate: an edge lets a relevant item through
+  [pass] edges are found                                 1 edge(s)
+  [pass] a candidate was put to the model                1 candidate(s)
+         nothing admitted: the model scored the personal memory below the 0.75
+         threshold for this query. That is the gate working — an edge says two
+         things are related, not that one answers any question.
+  [pass] nothing crossed, and the audit says the model declined rather than an error
+  [pass] an edge does not make a foreign item relevant to every question
+
+gate: fail closed
+  [pass] nothing crosses with the provider down
+  [pass] and the refusal says it failed closed
+  [pass] even with a perfect edge in place
+  [pass] with no provider at all, nothing crosses either
+
+gate: a weak edge is not consulted
+  [pass] a weak edge brings nothing across
+
+audit
+  [pass] every expansion is recorded, including the refusals
+  [pass] the audit holds a hash and never the question
+         outcomes seen: below_threshold, no_edges, no_provider, ok, provider_unavailable
+  [pass] cross_workspace_audit is append-only
+```
+
+```bash
+docker compose run --rm --entrypoint sh api -c \
+  'OPENROUTER_API_KEY=$(cat /run/secrets/jove/openrouter.key) node scripts/verify-cross-workspace.mjs'
+```
+
+### The asymmetry, which is the design
+
+Ordinary retrieval degrades **open**: a provider outage means three layers instead of four, and
+the results are still the user's own. Cross-workspace retrieval degrades **closed**: a provider
+outage means *nothing* crosses the boundary, ever.
+
+These are not the same trade. Returning slightly worse results is a quality problem, and this
+system has committed to accepting one. Returning another workspace's content because a safety
+check could not run is a context leak, and the whole point of one database per workspace is
+that it does not happen by accident.
+
+So a degraded search is a worse search, and a degraded cross-workspace search is a different
+system.
+
+### What the real model actually did
+
+The gate run above used the real `upstage/solar-decide`. Given a **confirmed** entity edge
+between a work memory about Bia and a personal memory about Bia, and the query *"how old is my
+daughter?"* asked in the work workspace, the model scored the personal memory **below** the
+0.75 threshold and nothing crossed.
+
+That is the property, demonstrated rather than asserted. A system that returned everything
+reachable through the edge would have called that a success. The edge says two things concern
+the same person; it does not say one of them answers this question, and the model is in the
+path precisely because that distinction is a judgement rather than a lookup.
+
+### Four bugs, and one of them would have made every test pass for the wrong reason
+
+**Parameter shadowing in the store.** `findCrossWorkspaceEdges({ workspace, itemIds })` — the
+destructured `workspace` shadowed the store's own, so the query ran against the **searching**
+workspace's database instead of the shared one. That database is empty of edges *by design*, so
+the lookup returned nothing, every edge-dependent test passed vacuously, and the fail-closed
+check "even with a perfect edge in place" reported zero edges found.
+
+The parameter is now `fromWorkspace`. The bug class is worth naming: **a query against the wrong
+database returns empty rather than erroring**, and empty is exactly what a passing assertion
+looks like.
+
+**The audit was written to the searching workspace.** A log of what crossed, held by whoever
+crossed it, is not an audit trail — it answers the question to whoever can already read that
+workspace and to nobody auditing the system. It now goes to `_shared`, and the searching
+workspace's store throws if asked to record it. A test asserts the throw.
+
+**`peerWorkspace` named the origin as its own peer**, twice, in two different ways. A provenance
+record that says "this came from `personal`, and the peer is `personal`" points nowhere. It is
+now derived from the origin's own workspace rather than from the querying one, so it cannot be
+inverted by a change in either.
+
+**Edge counts were lost on the refusal paths.** "No edge exists" and "every edge is too weak to
+consult" are different answers to different questions, and both were reported as `edges:
+undefined` when the second one mattered.
+
+### Why the threshold is high and may only rise
+
+`0.75`, against the write gate's `0.60`. Being too low leaks context across a boundary the user
+drew; being too high merely misses something they could have found by switching workspace. One
+of those is a privacy incident and the other is a missing result, so the scale is biased hard
+toward the first — and `docs/THRESHOLDS.md` marks `cross_workspace` as the one threshold that
+may only ever increase.
