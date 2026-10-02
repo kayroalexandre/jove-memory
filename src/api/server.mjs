@@ -38,6 +38,7 @@ const pools = createPoolManager(config, { logger });
  * surface as one failed query rather than as a clear message.
  */
 const embedder = config.providers.apiKey ? createEmbedder({ config, logger }) : null;
+const keySource = config.providers.keySource;
 
 if (!embedder) {
   logger.warn("no embedding provider configured", {
@@ -52,7 +53,7 @@ if (!embedder) {
  * build without a key, and the health endpoint has to work there — which is
  * the same reasoning as the health check making no outbound request.
  */
-export function createApp({ config, logger, pools, embedder = null }) {
+export function createApp({ config, logger, pools, embedder = null, keySource = null }) {
   async function checkPostgres() {
     try {
       const workspaces = await pools.listWorkspaces({ includeInfrastructure: true });
@@ -80,7 +81,16 @@ export function createApp({ config, logger, pools, embedder = null }) {
    */
   async function checkIndexing() {
     if (!embedder) {
-      return { status: "no embedder configured", note: "the vector arm is disabled in this build" };
+      return {
+        status: "no embedder configured",
+        // Whether the absence is a missing file or an unissued key. The two
+        // have completely different fixes, and "no embedder configured" on its
+        // own sends the reader to the wrong one of them.
+        detail: keySource
+          ? "OPENROUTER_API_KEY is empty or unreadable at the configured path"
+          : "no key configured; run `npm run key:set`, or set OPENROUTER_API_KEY",
+        note: "the vector arm is disabled in this build"
+      };
     }
     try {
       const workspaces = await pools.listWorkspaces();
@@ -123,7 +133,11 @@ export function createApp({ config, logger, pools, embedder = null }) {
       verified: false,
       note: configured
         ? "not probed: the health check makes no outbound request by design"
-        : "OPENROUTER_API_KEY is not set; retrieval runs on three layers"
+        : "no provider key found; retrieval runs on three layers",
+      // Where the key came from, never what it is. Useful for telling "I set
+      // it and the container cannot see it" apart from "I never set it", which
+      // are the two failures people actually hit with a key in a file.
+      source: configured ? keySource : null
     };
     return {
       openrouter: provider,
@@ -229,8 +243,8 @@ function send(res, status, body) {
   res.end(payload);
 }
 
-export function createHttpServer({ config, logger, pools, embedder = null }) {
-  const app = createApp({ config, logger, pools, embedder });
+export function createHttpServer({ config, logger, pools, embedder = null, keySource = null }) {
+  const app = createApp({ config, logger, pools, embedder, keySource });
 
   const server = createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host ?? "localhost"}`);
@@ -284,8 +298,8 @@ export function createHttpServer({ config, logger, pools, embedder = null }) {
 }
 
 /** Start the server and wire graceful shutdown. */
-export async function start({ config, logger, pools, embedder = null }) {
-  const server = createHttpServer({ config, logger, pools, embedder });
+export async function start({ config, logger, pools, embedder = null, keySource = null }) {
+  const server = createHttpServer({ config, logger, pools, embedder, keySource });
 
   await new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -342,7 +356,7 @@ export async function start({ config, logger, pools, embedder = null }) {
 }
 
 async function main() {
-  const { server, shutdown } = await start({ config, logger, pools, embedder });
+  const { server, shutdown } = await start({ config, logger, pools, embedder, keySource });
   // Keep the process alive; the http server does that on its own, but an
   // unhandled rejection should not leave a half-dead container.
   process.on("unhandledRejection", (reason) => {

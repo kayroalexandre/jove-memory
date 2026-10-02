@@ -18,7 +18,9 @@
     "lint": "node scripts/lint.mjs",
     "secret-scan": "node scripts/secret-scan.mjs",
     "calibrate": "node src/decisions/calibrate.mjs",
-    "verify": "npm run lint && npm run secret-scan && npm test"
+    "verify": "npm run lint && npm run secret-scan && npm test",
+    "key:set": "node scripts/set-provider-key.mjs",
+    "key:check": "node scripts/check-provider.mjs"
   },
   "dependencies": {
     "pg": "^8.23.1"

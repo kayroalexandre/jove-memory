@@ -354,3 +354,86 @@ back by the same distance query. The remaining step is one real request.
 
 This is recorded as unverified rather than assumed. Closing it needs an OpenRouter key, which has
 not been issued to this environment.
+
+---
+
+## Storing the provider key
+
+The key is read from a file in your home directory. It is not in this
+repository, not in `.env`, and not in a shell command.
+
+```bash
+npm run key:set      # prompts with echo off, writes ~/.config/jove-memory/openrouter.key
+npm run key:check    # verifies it against the live API, costs a fraction of a cent
+```
+
+### Why a file and not an environment variable
+
+The two obvious alternatives both leak:
+
+| Method | Where the key ends up |
+| --- | --- |
+| `OPENROUTER_API_KEY=sk-or-... npm run dev` | `~/.bash_history`, readable, survives `history -c` only partly |
+| Pasting into `.env` | Inside the repository, one `git add .` from being published |
+
+`~/.config/jove-memory/openrouter.key` is outside all of that: not in the
+project directory, not in a shell history, not in a terminal scrollback. It is
+written mode `600` inside a directory mode `700`.
+
+`config.mjs` **refuses** to read a key from inside the repository, as a hard
+error rather than a warning. A gitignored file is still a file in a directory
+that gets zipped, backed up and rsynced, and a warning is something that gets
+clicked past exactly once.
+
+### Where the key is looked for
+
+In order:
+
+1. `OPENROUTER_API_KEY` in the environment — for CI, and for anyone who
+   already exports it.
+2. `$JOVE_SECRETS_DIR/openrouter.key`, defaulting to
+   `~/.config/jove-memory/openrouter.key`.
+3. `/run/secrets/jove/openrouter.key` — where `compose.yml` mounts it, so a
+   container and a local process read the same file.
+4. `/run/secrets/openrouter_api_key` — the conventional single-file mount, for
+   `docker run --mount type=secret` and for orchestrators that mount files
+   rather than directories.
+
+A missing file is not an error. The stack starts and serves health without a
+key, which is Phase 2's gate, and every *use* of the key fails loudly at the
+call site.
+
+### What the health endpoint reports
+
+`/health` reports **which source** answered, never the value:
+
+```json
+"openrouter": {
+  "status": "configured",
+  "verified": false,
+  "source": "file:/root/.config/jove-memory/openrouter.key"
+}
+```
+
+`"source": null` means no key was found. That distinguishes the two failures
+people actually hit — "I set it and the container cannot see it" versus "I never
+set it" — which `status` alone cannot.
+
+`verified` stays `false` permanently. Verifying it would mean an outbound
+request on every container restart, and orchestrators schedule those.
+
+### Moving the key elsewhere
+
+```bash
+export JOVE_SECRETS_DIR=/some/other/dir
+```
+
+Nothing in the repository depends on the default path. `compose.yml` reads the
+same variable, so the container follows.
+
+### Rotating
+
+`npm run key:set` overwrites atomically — written to a temporary file in the
+same directory, then renamed — so an interrupted save cannot leave a truncated
+key that looks valid. A failed save leaves the previous key in place: clearing a
+working key is the one outcome worse than the one already there.
