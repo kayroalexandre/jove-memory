@@ -55,22 +55,75 @@ function assertOutsideRepository(path) {
 }
 
 /**
+ * Where a key file may live, as directories, in preference order.
+ *
+ * Exported so `scripts/set-provider-key.mjs` and this module cannot drift
+ * apart. That drift is not hypothetical: the first version of the setup script
+ * hardcoded `~/.config/jove-memory` while this module looked in two other
+ * places, so a key written by one could be invisible to the other.
+ *
+ * `~/.config` is listed first because it is the conventional location, but it
+ * is not assumed to exist. On this machine it is owned by root, and a
+ * directory another user owns is not a place to put a credential — the setup
+ * script falls through to the next candidate rather than failing, and says
+ * which one it used.
+ */
+export function keyDirectoryCandidates(env = process.env) {
+  if (env.JOVE_SECRETS_DIR) return [env.JOVE_SECRETS_DIR];
+
+  // `env.HOME` first, not `os.homedir()`. os.homedir() reads the process
+  // environment, so a caller passing an explicit environment — a test, or
+  // anything that wants a scratch home — would have it ignored, and the only
+  // way to test the fallback list would be to create directories in the real
+  // home directory as a side effect.
+  const home = env.HOME || homedir();
+
+  return [
+    join(home, ".config", "jove-memory"),
+    join(home, ".local", "share", "jove-memory"),
+    join(home, ".jove-memory")
+  ];
+}
+
+/**
+ * Every file the key may be read from, in order.
+ *
+ * The environment is handled separately and first — it is not a file, and it
+ * must win over a stale one on disk.
+ */
+export function keyFileCandidates(env = process.env) {
+  const paths = [];
+
+  if (env.OPENROUTER_API_KEY_FILE) paths.push(env.OPENROUTER_API_KEY_FILE);
+
+  for (const dir of keyDirectoryCandidates(env)) {
+    paths.push(join(dir, "openrouter.key"));
+  }
+
+  // Where compose.yml mounts that directory, so a container and a local
+  // process read the same file and there is exactly one place to look.
+  paths.push("/run/secrets/jove/openrouter.key");
+  // The conventional single-file mount, for `docker run --mount type=secret`
+  // and for orchestrators that mount files rather than directories.
+  paths.push("/run/secrets/openrouter_api_key");
+
+  return paths;
+}
+
+/**
  * Read the OpenRouter key, in order of preference.
  *
  *   1. `OPENROUTER_API_KEY` in the environment. For CI and for anyone who
  *      already exports it. A key in an environment variable is invisible to
  *      `git status` and to a directory listing.
- *   2. `OPENROUTER_API_KEY_FILE` — a path to a file whose contents are the key.
- *      The recommended path, and what `npm run key:set` produces.
- *   3. Docker's conventional secret mount, `/run/secrets/openrouter_api_key`.
- *      Used by `docker compose` when a secret is declared.
+ *   2. A key file. See `keyFileCandidates`.
  *
  * Trailing whitespace and surrounding quotes are stripped. A key pasted from a
  * web page very often arrives with one or both, and a key with a trailing
  * newline in a file is the single most common way an otherwise-correct setup
  * fails with a 401 that looks like a wrong key.
  */
-function readApiKey() {
+function readApiKey(env) {
   resolvedKeySource = null;
 
   const fromEnv = optional("OPENROUTER_API_KEY", "");
@@ -79,23 +132,7 @@ function readApiKey() {
     return fromEnv.trim();
   }
 
-  const explicit = optional("OPENROUTER_API_KEY_FILE", "");
-  const candidates = explicit
-    ? [explicit]
-    : [
-        join(
-          process.env.JOVE_SECRETS_DIR ?? join(homedir(), ".config", "jove-memory"),
-          "openrouter.key"
-        ),
-        // Where compose.yml mounts that directory, so a container and a local
-        // process read the same file and there is exactly one place to look.
-        "/run/secrets/jove/openrouter.key",
-        // The conventional single-file mount, for `docker run --mount
-        // type=secret` and for orchestrators that mount files not directories.
-        "/run/secrets/openrouter_api_key"
-      ];
-
-  for (const path of candidates) {
+  for (const path of keyFileCandidates(env)) {
     if (!path) continue;
     assertOutsideRepository(path);
     let contents;
@@ -203,7 +240,7 @@ export function loadConfig(env = process.env) {
         // The health endpoint reports the absence. Nothing silently degrades.
         //
         // Read from a file as well as the environment — see `readApiKey`.
-        apiKey: readApiKey(),
+        apiKey: readApiKey(env),
       // Which of the three sources answered, for the health endpoint. Never
       // the value. "I set it and the container cannot see it" and "I never set
       // it" are the two failures people actually hit, and the source tells

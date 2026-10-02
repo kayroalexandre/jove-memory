@@ -338,8 +338,13 @@ test("a missing key is a runtime error, never a silent degradation", () => {
   const config = readFileSync("src/config.mjs", "utf8");
   assert.match(
     config,
-    /apiKey: readApiKey\(\)/,
+    /apiKey: readApiKey\(env\)/,
     "the key must resolve to an empty string when absent, not throw at boot"
+  );
+  assert.match(
+    config,
+    /keyFileCandidates/,
+    "and the search list must be shared with the setup script rather than duplicated"
   );
   assert.match(
     config,

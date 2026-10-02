@@ -22,6 +22,9 @@ import { loadConfig } from "../src/config.mjs";
 const KEY = ["sk", "or", "v1", "abcdefghijklmnopqrstuvwxyz0123456789"].join("-");
 const BASE = { POSTGRES_PASSWORD: "unused" };
 
+/** The output sinks a key must never reach. Shared with the negative control. */
+const SINKS = [/\bout\(/, /console\.(log|error|warn)\(/, /process\.stdout\.write\(/];
+
 function scratch() {
   return mkdtempSync(join(tmpdir(), "jove-key-"));
 }
@@ -162,22 +165,35 @@ test("the key file the setup script writes is not inside the repository", () => 
   // TTY and would overwrite whatever the user actually has.
   const source = readFileSync("scripts/set-provider-key.mjs", "utf8");
 
-  // The location is a static property of the script, so it is asserted from
-  // the source rather than by running it. Running it would need a TTY and
-  // would overwrite whatever key the user actually has.
+  // The location is no longer a single hardcoded path: the script asks
+  // `config.mjs` for candidates and picks the first it can actually secure.
+  // That is the fix for the failure this test was written for — the preferred
+  // directory was owned by root, so a hardcoded path could not work at all.
   assert.match(
     source,
-    /join\(homedir\(\), "\.config", "jove-memory"\)/,
-    "it writes under the user's config directory, resolved from the real home"
+    /keyDirectoryCandidates/,
+    "the script must take its candidate directories from the config module"
+  );
+  assert.match(
+    source,
+    /secureDirectory\(/,
+    "and must check each one is securable before asking for the key"
+  );
+  // A relative *import* is fine; a relative *key path* is not, because the
+  // script would then be writing into whatever directory it happened to be run
+  // from — which is the project.
+  assert.ok(
+    !/join\(\s*"\.\.?\//.test(source) && !/join\([^)]*"\.\.\//.test(source),
+    "no key path may be built relative to the working directory"
+  );
+  assert.match(
+    source,
+    /secureWriteFile/,
+    "writing must go through the verify-then-delete path, not a bare writeFileSync"
   );
   assert.ok(
-    !source.includes('join("..")') && !source.includes('"./'),
-    "and never a path relative to the working directory"
-  );
-  assert.match(
-    source,
-    /process\.env\.JOVE_SECRETS_DIR/,
-    "overridable, so nothing in the repository depends on that path existing"
+    !/\bwriteFileSync\(/.test(source),
+    "a bare writeFileSync would create a credential with default permissions"
   );
 });
 
@@ -186,15 +202,98 @@ test("the setup script never prints the value it read", () => {
 
   // The only thing reported about the key is its length. Enough to catch an
   // empty paste, not enough to reconstruct anything.
-  assert.ok(
-    !/out\([^)]*key\b(?!\)|[\s,;]*$)/i.test(source) || !/\$\{key\}/.test(source),
-    "the key must never be interpolated into output"
-  );
   assert.ok(!source.includes("${key}"), "the raw value must not appear in a template");
   assert.match(source, /read -rs/, "and it must be read with echo off");
-  assert.match(source, /0o600/, "written 600");
-  assert.match(source, /0o700/, "in a 700 directory");
+
+  // Prose about keys is fine; the *value* reaching output is not. So the
+  // strings are stripped before looking for the identifier, which is the only
+  // way to tell `out("paste the key")` from `out(key)`.
+  //
+  // The previous version of this assertion tested "no out() call mentions the
+  // word key", which the script's own prompts fail — so it was loosened until
+  // it passed, and the property it was written for went untested.
+  const code = stripStringsAndComments(source);
+  for (const sink of SINKS) {
+    assert.ok(
+      !new RegExp(`${sink.source}[^)]*\\bkey\\b`).test(code),
+      `the value must never reach output via ${sink.source}`
+    );
+  }
+
+  // The modes moved to lib/secure-file.mjs, so the assertion belongs there.
+  const lib = readFileSync("scripts/lib/secure-file.mjs", "utf8");
+  assert.match(lib, /0o600/);
+  assert.match(lib, /0o700/);
 });
+
+/**
+ * Remove string literals, template literals and comments.
+ *
+ * Crude and sufficient: this is a source-text check looking for an identifier
+ * in an argument position, and a badly-stripped comment cannot make one appear
+ * where it was not.
+ */
+test("the leak detector is not vacuous", () => {
+  // An assertion that cannot fail is not an assertion. Each of these is a
+  // snippet that really does leak, fed through the same stripping and the same
+  // patterns the real test uses. If the detector ever goes blind — because
+  // someone loosened a pattern to make it pass — this fails.
+  const leaks = [
+    "out(key);",
+    "console.log(`the key is ${key}`);",
+    "process.stdout.write(key);",
+    "out(prefix + key);",
+    "console.error('failed for', key);"
+  ];
+
+  for (const snippet of leaks) {
+    const code = stripStringsAndComments(snippet);
+    const caught = SINKS.some((sink) => new RegExp(`${sink.source}[^)]*\\bkey\\b`).test(code));
+    assert.ok(caught, `the detector missed: ${snippet}`);
+  }
+
+  // And prose that merely mentions a key must not trip it, which is why the
+  // strings are stripped first.
+  const clean = ['out("Paste the key and press enter");', "out(`  current    ${describe()}`);"];
+  for (const snippet of clean) {
+    const code = stripStringsAndComments(snippet);
+    const caught = SINKS.some((sink) => new RegExp(`${sink.source}[^)]*\\bkey\\b`).test(code));
+    assert.equal(caught, false, `false positive on: ${snippet}`);
+  }
+});
+
+function stripStringsAndComments(source) {
+  // Interpolations are lifted out first and put back afterwards, so the text of
+  // a template literal is stripped while its `${...}` survives.
+  //
+  // Without this, `` console.log(`the key is ${key}`) `` reduces to
+  // `` console.log(``) `` and a genuine leak becomes invisible. The negative
+  // control below caught exactly that.
+  const interpolated = [];
+  const marked = source.replace(/\$\{([^{}]*)\}/g, (_, expression) => {
+    interpolated.push(expression);
+    return `\u0000${interpolated.length - 1}\u0000`;
+  });
+
+  // The template pass has to be marker-aware: a plain replacement eats the
+  // markers along with the literal text, and then there is nothing to restore.
+  const stripped = marked
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/(^|[^:])\/\/[^\n]*/g, "$1 ")
+    .replace(/`(?:\\.|[^`\\])*`/g, (match) => `\u0001${(match.match(/\u0000\d+\u0000/g) ?? []).join("")}\u0001`)
+    .replace(/"(?:\\.|[^"\\])*"/g, '""')
+    .replace(/'(?:\\.|[^'\\])*'/g, "''");
+
+  // Backticks and interpolations use different marker characters on purpose. An
+  // earlier version tagged the template with a letter next to the index, and
+  // the two interleaved so that no longer parsed as a pair: a template holding
+  // one interpolation restored to a stray control character followed by the
+  // expression, and the leak went undetected. Caught by the control below.
+  return stripped
+    .replace(/\u0001\u0001/g, "``")
+    .replace(/\u0001([\s\S]*?)\u0001/g, (_, inner) => `\`${inner}\``)
+    .replace(/\u0000(\d+)\u0000/g, (_, index) => interpolated[Number(index)]);
+}
 
 test("the health endpoint reports the key source, never the key", () => {
   const source = readFileSync("src/api/server.mjs", "utf8");
