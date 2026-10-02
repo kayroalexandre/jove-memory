@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync } from "node:fs";
+import { join } from "node:path";
 
 /**
  * The project's own invariants, asserted against the files that declare them.
@@ -238,6 +239,110 @@ test("README and package.json agree on the project name", () => {
   const readme = readFileSync("README.md", "utf8");
   assert.equal(pkg.name, "jove-memory");
   assert.ok(readme.includes("jove-memory"), "README must reference the project name");
+});
+
+test("only the store directory writes SQL", () => {
+  // Load-bearing: the retrieval layer is testable without a database only
+  // because the queries over memory data all live in one place. A SELECT that
+  // escapes into src/retrieval/ breaks that, silently, the first time someone
+  // needs to test the ranking logic without a server.
+  //
+  // Scoped to src/store/ rather than to store.mjs alone, because the two
+  // siblings legitimately need their own SQL: migrate.mjs applies DDL, and
+  // pool.mjs runs the CREATE DATABASE and pg_stat_activity queries that
+  // database-per-workspace depends on (ADR-003). Those are statements about
+  // databases, not about memories. An earlier version of this test asserted
+  // the narrower claim and failed on both files, which is what revealed the
+  // comment at the top of store.mjs was overstated.
+  const offenders = [];
+  const walk = (dir) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(path);
+        continue;
+      }
+      if (!entry.name.endsWith(".mjs")) continue;
+      if (path.startsWith(join("src", "store"))) continue;
+
+      const content = readFileSync(path, "utf8");
+      if (/\b(SELECT|INSERT INTO|UPDATE\s+\w+\s+SET|DELETE FROM)\b/.test(content)) {
+        offenders.push(path);
+      }
+    }
+  };
+  walk("src");
+
+  assert.deepEqual(
+    offenders,
+    [],
+    `SQL over memory data found outside src/store/: ${offenders.join(", ")}. Queries ` +
+      `about memories belong to the store; everything above it calls methods.`
+  );
+});
+
+test("store.mjs does not overstate its own scope", () => {
+  // The comment claiming sole ownership of all SQL was wrong: two siblings
+  // need their own. A comment that claims more than the code delivers is the
+  // kind of thing that gets trusted, which is the whole reason this file
+  // exists.
+  const store = readFileSync("src/store/store.mjs", "utf8");
+  assert.ok(
+    !/the only module in the project that writes SQL/i.test(store),
+    "store.mjs must not claim sole ownership of all SQL — migrate.mjs and pool.mjs have their own"
+  );
+  assert.match(
+    store,
+    /only module that writes (SQL|queries)/i,
+    "store.mjs must still state the invariant, scoped accurately"
+  );
+});
+
+test("the absence of an ANN index is documented, not silent", () => {
+  // pgvector 0.8.6 cannot build an HNSW index above 2000 dimensions and
+  // gemini-embedding-2 is 3072, so the vector arm is an exact search. That is a
+  // latency constraint rather than a correctness one, but a reader who finds
+  // no ANN index and no explanation will assume one of the two is a bug.
+  const migration = readFileSync("src/store/migrations/0002_retrieval.sql", "utf8");
+  assert.ok(
+    !/USING\s+hnsw/i.test(migration),
+    "an HNSW index cannot be created at 3072 dimensions; if this migration grew one, " +
+      "either the width changed or pgvector did"
+  );
+  assert.match(
+    migration,
+    /2000 dimensions/i,
+    "the migration must state the pgvector dimension limit it is working around"
+  );
+
+  const arch = readFileSync("docs/ARCHITECTURE.md", "utf8");
+  assert.ok(
+    !/pgvector`? with HNSW/i.test(arch),
+    "ARCHITECTURE.md must not still promise HNSW — the limit makes it impossible"
+  );
+  assert.match(arch, /2000/i, "ARCHITECTURE.md must record the measured limit");
+});
+
+test("the vector arm's distance floor is opt-in, never silently zero", () => {
+  // minSimilarity defaults to null, which returns the K nearest to any query at
+  // all. That is the right default for a phase where the floor has not been
+  // calibrated and the wrong default is a measured one. What must never happen
+  // is a zero floor presented as if it were a meaningful threshold, so this
+  // asserts the parameter exists and is documented as a calibration target.
+  const store = readFileSync("src/store/store.mjs", "utf8");
+  assert.match(store, /minSimilarity/);
+  assert.match(
+    store,
+    /minSimilarity !== null/,
+    "a zero floor must be distinguishable from no floor at all"
+  );
+
+  const thresholds = readFileSync("docs/THRESHOLDS.md", "utf8");
+  assert.match(
+    thresholds,
+    /minSimilarity|distance floor/i,
+    "docs/THRESHOLDS.md must list the distance floor among the values it calibrates"
+  );
 });
 
 test("the model documented in ARCHITECTURE.md matches .env.example", () => {

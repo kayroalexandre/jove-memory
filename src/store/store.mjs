@@ -9,9 +9,15 @@ import {
 /**
  * The store.
  *
- * This is the only module in the project that writes SQL. Everything above it
- * calls these methods and never sees a query string, which is what makes the
- * retrieval layers in Phase 3 testable without a database.
+ * This is the only module that writes SQL *about memories*. Its two siblings
+ * have their own, necessarily: migrate.mjs applies DDL, and pool.mjs runs the
+ * CREATE DATABASE and pg_stat_activity queries that one-database-per-workspace
+ * depends on (ADR-003). Those are statements about databases rather than about
+ * memories, which is the line that matters.
+ *
+ * Everything above this directory calls these methods and never sees a query
+ * string, which is what makes the retrieval layers in Phase 3 testable without
+ * a database.
  *
  * The method surface matches the upstream SQLite store, so the MCP layer ports
  * across without being rewritten (ADR-001).
@@ -40,6 +46,37 @@ function toItem(row) {
     deleted_at: row.deleted_at?.toISOString?.() ?? row.deleted_at ?? null,
     supersedes: row.supersedes ?? null
   };
+}
+
+/**
+ * Render a JS array of numbers as pgvector's literal form.
+ *
+ * `[1,2,3]` rather than a bound parameter: node-postgres has no pgvector type
+ * parser installed, so a JS array bound to `$1::vector` comes back as the
+ * string `"1,2,3"` and PostgreSQL rejects it. The literal is built here
+ * rather than at the call site so the validation is in one place.
+ *
+ * Every element is checked to be a finite number. NaN or Infinity reaching
+ * pgvector produces a vector that matches nothing, with no error anywhere —
+ * which surfaces as "search is broken" rather than "the embedder returned
+ * garbage".
+ */
+function toVectorLiteral(vector) {
+  if (!Array.isArray(vector)) {
+    throw new TypeError(`A vector must be an array of numbers, got ${typeof vector}`);
+  }
+  if (vector.length === 0) {
+    throw new RangeError("A vector must have at least one element");
+  }
+  for (const [index, value] of vector.entries()) {
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      throw new RangeError(
+        `Vector element ${index} is ${value}. A NaN or Infinity in a vector ` +
+          `produces one that matches nothing, silently.`
+      );
+    }
+  }
+  return `[${vector.join(",")}]`;
 }
 
 function toNode(row) {
@@ -644,6 +681,382 @@ export function createStore({ workspace, pools, logger = null, clock = () => new
       return { cacheKey, model, dimensions };
     },
 
+    // -----------------------------------------------------------------------
+    // Layer 1: vector
+    // -----------------------------------------------------------------------
+
+    /**
+     * The declared width of the embedding column, in this database.
+     *
+     * Read from information_schema rather than assumed from config, because a
+     * mismatch between the two produces a distance function that returns
+     * nonsense rather than an error. `google/gemini-embedding-2` and any other
+     * model do not share a vector space (ADR-005), so this is the check that
+     * keeps a re-embed from silently producing nonsense distances.
+     */
+    async vectorDimensions() {
+      const { rows } = await pools.poolFor(workspace).query(
+        `SELECT a.atttypmod AS width
+         FROM pg_attribute a
+         JOIN pg_class c ON c.oid = a.attrelid
+         WHERE c.relname = 'memory_item_vectors'
+           AND a.attname = 'embedding'
+           AND a.attnum > 0
+           AND NOT a.attisdropped`
+      );
+      return rows[0] ? Number(rows[0].width) : null;
+    },
+
+    /**
+     * Store or replace an item's embedding.
+     *
+     * The model id travels with the vector. When the embedder changes, the old
+     * vectors stay and are excluded by `searchVector`'s model filter rather
+     * than being mixed with new ones — two models' vectors in one index are
+     * meaningless, and an index that silently contains both is the failure
+     * this column prevents.
+     */
+    async upsertItemVector(itemId, model, vector) {
+      const literal = toVectorLiteral(vector);
+      const { rows } = await pools.poolFor(workspace).query(
+        `INSERT INTO memory_item_vectors (item_id, model, embedding)
+         VALUES ($1, $2, $3::vector)
+         ON CONFLICT (item_id) DO UPDATE SET
+           model = EXCLUDED.model,
+           embedding = EXCLUDED.embedding,
+           embedded_at = now()
+         RETURNING item_id, model, embedded_at`,
+        [itemId, model, literal]
+      );
+      return rows[0] ?? null;
+    },
+
+    /**
+     * Cosine-similarity search.
+     *
+     * `similarity` is returned alongside the rank because it is the only thing
+     * that tells a caller *how* close a match was. RRF discards it, which is
+     * the point, but a human debugging a bad result has nothing else.
+     *
+     * Deleted and invalidated items are excluded in SQL, not in JavaScript:
+     * the filter has to be applied before the LIMIT or the top-K is full of
+     * rows the caller cannot use.
+     */
+    async searchVector(queryVector, { limit = 20, model = null, minSimilarity = null } = {}) {
+      const literal = toVectorLiteral(queryVector);
+      const values = [literal];
+      const conditions = ["i.deleted_at IS NULL"];
+
+      // A distance floor, applied in SQL so the LIMIT is not filled with rows
+      // the caller will discard.
+      //
+      // Without it the vector arm returns the K nearest items to *any* query,
+      // including a query about something entirely absent from memory. That
+      // makes it impossible to distinguish "nothing relevant is stored" from
+      // "the index is broken", which is the one distinction a caller needs
+      // most. It also means every search returns exactly K results, so the
+      // result count carries no information at all.
+      //
+      // The default is a starting value, not a measured one. It belongs to the
+      // same calibration set as the decision thresholds — see
+      // docs/THRESHOLDS.md — and this build reports whatever it used rather
+      // than pretending it is final.
+      if (minSimilarity !== null) {
+        values.push(minSimilarity);
+        conditions.push(`1 - (v.embedding <=> $1::vector) >= $${values.length}`);
+      }
+
+      if (model) {
+        values.push(model);
+        conditions.push(`v.model = $${values.length}`);
+      }
+
+      const { rows } = await pools.poolFor(workspace).query(
+        `SELECT i.*, v.model AS embed_model,
+                1 - (v.embedding <=> $1::vector) AS similarity
+         FROM memory_item_vectors v
+         JOIN memory_items i ON i.id = v.item_id
+         WHERE ${conditions.join(" AND ")}
+         ORDER BY v.embedding <=> $1::vector
+         LIMIT $${values.length + 1}`,
+        [...values, limit]
+      );
+
+      return rows.map((row) => ({
+        id: row.id,
+        item: toItem(row),
+        similarity: Number(row.similarity),
+        embedModel: row.embed_model
+      }));
+    },
+
+    /** How many items have a vector, for which models. */
+    async vectorCoverage() {
+      const { rows } = await pools.poolFor(workspace).query(
+        `SELECT v.model, count(*)::int AS count,
+                min(v.embedded_at) AS oldest, max(v.embedded_at) AS newest
+         FROM memory_item_vectors v
+         JOIN memory_items i ON i.id = v.item_id
+         WHERE i.deleted_at IS NULL
+         GROUP BY v.model
+         ORDER BY v.model`
+      );
+      return rows.map((row) => ({
+        model: row.model,
+        count: Number(row.count),
+        oldest: row.oldest?.toISOString?.() ?? null,
+        newest: row.newest?.toISOString?.() ?? null
+      }));
+    },
+
+    // -----------------------------------------------------------------------
+    // Layer 2: lexical
+    // -----------------------------------------------------------------------
+
+    /**
+     * Full-text search.
+     *
+     * `websearch_to_tsquery` rather than `plainto_tsquery`: the former
+     * understands quoted phrases and OR, so a query containing them is not
+     * silently reduced to a bag of ANDed words. `plainto` would accept
+     * `"deploy plan"` and search for all four words in any order, which
+     * returns documents that contain the words and not the phrase.
+     *
+     * The rank is normalised to [0,1] by dividing by the best score in the
+     * result set. RRF does not use it; the report does.
+     */
+    async searchBm25(query, { limit = 20, nodeId = null, tags = [] } = {}) {
+      const trimmed = String(query ?? "").trim();
+      if (!trimmed) return [];
+
+      const values = [trimmed];
+      const conditions = [
+        "deleted_at IS NULL",
+        "search_vector @@ websearch_to_tsquery('english', $1)"
+      ];
+
+      if (nodeId) {
+        values.push(nodeId);
+        conditions.push(`node_id = $${values.length}`);
+      }
+      for (const tag of tags) {
+        values.push(JSON.stringify([tag]));
+        conditions.push(`tags @> $${values.length}::jsonb`);
+      }
+
+      const { rows } = await pools.poolFor(workspace).query(
+        `WITH scored AS (
+           SELECT *, ts_rank_cd(search_vector, websearch_to_tsquery('english', $1)) AS rank
+           FROM memory_items
+           WHERE ${conditions.join(" AND ")}
+         ),
+         best AS (SELECT max(rank) AS top FROM scored)
+         SELECT scored.*, CASE WHEN best.top > 0
+                                THEN scored.rank / best.top
+                                ELSE 0 END AS normalised
+         FROM scored, best
+         WHERE scored.rank > 0
+         ORDER BY scored.rank DESC, scored.id ASC
+         LIMIT $${values.length + 1}`,
+        [...values, limit]
+      );
+
+      return rows.map((row) => ({
+        id: row.id,
+        item: toItem(row),
+        rank: Number(row.rank),
+        normalised: Number(row.normalised)
+      }));
+    },
+
+    // -----------------------------------------------------------------------
+    // Layer 3: graph
+    // -----------------------------------------------------------------------
+
+    /** Record an edge. Duplicate edges are refused, not silently merged. */
+    async addEdge(fromItem, toItem, relation, { weight = 1.0, source = "system" } = {}) {
+      if (fromItem === toItem) {
+        // A self-edge is always a bug: a hop that reaches nowhere, which
+        // looks like a hit and contributes a phantom vote to the fusion.
+        throw new Error(
+          `Refusing a self-edge on "${fromItem}" (${relation}). It adds a hop ` +
+            `that reaches nowhere.`
+        );
+      }
+
+      const { rows } = await pools.poolFor(workspace).query(
+        `INSERT INTO entity_edges (from_item, to_item, relation, weight, source)
+         VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT DO NOTHING
+         RETURNING *`,
+        [fromItem, toItem, relation, weight, source]
+      );
+      // ON CONFLICT DO NOTHING with no unique index means duplicates are
+      // actually inserted. Caught here rather than by adding a constraint
+      // that would forbid a legitimate second edge of a different relation.
+      if (!rows[0]) {
+        const { rows: existing } = await pools.poolFor(workspace).query(
+          "SELECT * FROM entity_edges WHERE from_item=$1 AND to_item=$2 AND relation=$3 LIMIT 1",
+          [fromItem, toItem, relation]
+        );
+        return existing[0] ?? null;
+      }
+      return rows[0];
+    },
+
+    /**
+     * Walk the graph outward from a set of seed items.
+     *
+     * A recursive CTE rather than a round trip per hop: two hops of traversal
+     * in one query instead of two queries, and the hop count comes back with
+     * the row so the caller can weight by distance.
+     *
+     * `maxDepth` is capped. An unbounded walk over a graph with a cycle is a
+     * query that does not return, and a memory graph will have cycles the
+     * moment two memories mention the same entity.
+     */
+    async traverseGraph(seedIds, { limit = 20, maxDepth = 2, relations = null, minWeight = 0 } = {}) {
+      if (!Array.isArray(seedIds) || seedIds.length === 0) return [];
+      if (maxDepth < 1) return [];
+      // Three is enough for personal memory and low enough that a cycle
+      // cannot run away. The cap is a correctness property, not a preference.
+      const depth = Math.min(maxDepth, 3);
+
+      // Parameter indices assigned explicitly rather than derived from the
+      // values array. A derived index silently collides the moment the
+      // `relations` filter is absent, and the symptom is a LIMIT clause
+      // reading a hop count — a traversal that returns the wrong rows without
+      // erroring.
+      const params = [seedIds, depth, minWeight, limit];
+      const SEEDS = "$1";
+      const MAX_DEPTH = "$2";
+      const MIN_WEIGHT = "$3";
+      const LIMIT = "$4";
+
+      // The seed is already excluded from its own walk by the path guard in
+      // the recursive term: the seed is the first element of `path`, so
+      // `NOT (e.to_item = ANY(w.path))` can never walk back onto it.
+      //
+      // An *overall* `id <> ALL(seeds)` filter is deliberately absent. With
+      // ten seeds — which is what arms 1 and 2 return — it would exclude
+      // every item in the corpus and the graph arm could never return
+      // anything. Overlap between arms is the thing RRF exists to reward, so
+      // an item reachable from one seed and already found by the vector arm
+      // earns two votes, which is the correct reading of "two layers agree".
+      const filters = ["i.deleted_at IS NULL"];
+      if (relations) {
+        params.push(relations);
+        filters.push(`scored.relation = ANY($${params.length})`);
+      }
+
+      const { rows } = await pools.poolFor(workspace).query(
+        `WITH RECURSIVE walk AS (
+           SELECT e.to_item AS id, e.relation, e.weight, 1 AS depth,
+                  ARRAY[e.from_item] AS path
+           FROM entity_edges e
+           WHERE e.from_item = ANY(${SEEDS})
+             AND e.weight >= ${MIN_WEIGHT}
+           UNION ALL
+           SELECT e.to_item, e.relation, e.weight, w.depth + 1, w.path || e.from_item
+           FROM entity_edges e
+           JOIN walk w ON e.from_item = w.id
+           WHERE w.depth < ${MAX_DEPTH}
+             AND e.weight >= ${MIN_WEIGHT}
+             AND NOT (e.to_item = ANY(w.path))
+         ),
+         nearest AS (
+           -- DISTINCT ON with an ORDER BY is how "best hop per item" is
+           -- expressed in SQL. The outer ORDER BY then re-sorts the surviving
+           -- rows by that score, which the window function supplies.
+           SELECT DISTINCT ON (w.id)
+                  w.id, w.depth, w.relation, w.weight
+           FROM walk w
+           ORDER BY w.id, w.depth ASC, w.weight DESC
+         ),
+         scored AS (
+           SELECT n.id, n.depth, n.relation, n.weight,
+                  (n.weight / (n.depth + 1))::float8 AS score
+           FROM nearest n
+         )
+         SELECT scored.*, i.*
+         FROM scored
+         JOIN memory_items i ON i.id = scored.id
+         WHERE ${filters.join(" AND ")}
+         ORDER BY scored.score DESC, scored.id ASC
+         LIMIT ${LIMIT}`,
+        params
+      );
+
+      return rows.map((row) => ({
+        id: row.id,
+        item: toItem(row),
+        depth: Number(row.depth),
+        relation: row.relation,
+        // Weight falls off with distance. `1/(depth+1)` rather than a hand-picked
+        // per-level multiplier: a hop count is known, a "how much does a
+        // second-hand mention count" coefficient is a guess.
+        score: Number(row.weight) / (Number(row.depth) + 1)
+      }));
+    },
+
+    /** Every edge touching an item, in either direction. */
+    async edgesFor(itemId) {
+      const { rows } = await pools.poolFor(workspace).query(
+        `SELECT *, CASE WHEN from_item = $1 THEN 'out' ELSE 'in' END AS direction
+         FROM entity_edges
+         WHERE from_item = $1 OR to_item = $1
+         ORDER BY weight DESC`,
+        [itemId]
+      );
+      return rows;
+    },
+
+    // -----------------------------------------------------------------------
+    // Search accounting
+    // -----------------------------------------------------------------------
+
+    /**
+     * Persist one search run.
+     *
+     * `arm_hits` is a JSONB object with one key per arm, and a null value for
+     * an arm that did not run. A zero and a null are different facts: zero is
+     * "the arm ran and matched nothing", null is "the arm was skipped". The
+     * Phase 3 gate is that all four are distinguishable, so the schema has to
+     * be able to say it.
+     */
+    async recordSearchRun({
+      queryHash,
+      workspace: runWorkspace = workspace,
+      armHits = {},
+      weights = {},
+      rrfK = null,
+      results = 0,
+      tookMs = null,
+      bm25Engine = null,
+      embedModel = null
+    }) {
+      await pools.poolFor(runWorkspace).query(
+        `INSERT INTO search_runs
+           (query_hash, workspace, vector_hits, bm25_hits, graph_hits, temporal_hits,
+            weights, rrf_k, results, took_ms, bm25_engine, embed_model)
+         VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11,$12)`,
+        [
+          queryHash,
+          runWorkspace,
+          armHits.vector ?? null,
+          armHits.bm25 ?? null,
+          armHits.graph ?? null,
+          armHits.temporal ?? null,
+          JSON.stringify(weights),
+          rrfK,
+          results,
+          tookMs,
+          bm25Engine,
+          embedModel
+        ]
+      );
+    },
+
     /** Record a decision-model call. Every call, not only the applied ones. */
     async recordDecision(record) {
       const { rows } = await pools.poolFor(workspace).query(
@@ -769,4 +1182,4 @@ export function createStore({ workspace, pools, logger = null, clock = () => new
   };
 }
 
-export { toItem, toNode, isSharedWorkspace, quoteIdentifier };
+export { toItem, toNode, isSharedWorkspace, quoteIdentifier, toVectorLiteral };

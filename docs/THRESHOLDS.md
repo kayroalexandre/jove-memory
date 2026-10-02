@@ -32,6 +32,37 @@ a constant chosen in advance.
 | `write_gate` | Whether content is stored | Noise accumulates | Valid memory is discarded |
 | `rerank` | Which candidates survive | Irrelevant items crowd out relevant ones | Relevant items are dropped |
 | `cross_workspace` | Whether another workspace is consulted | Context bleeds across workspaces | Useful cross-workspace context never surfaces |
+| `min_similarity` | The vector arm's distance floor | Every search returns K results, so "nothing relevant is stored" and "the index is broken" look identical | Relevant memories are dropped because they sit just under the floor |
+
+### On `min_similarity` specifically
+
+This one is not a decision-model question, so the pipeline in the next section
+does not produce it. It is measured directly, from `search_runs`, and it is
+listed here because it has the same property that matters: a hand-picked
+number means nothing on its own.
+
+The reason it exists at all is worth stating, because the default is counter-
+intuitive. `minSimilarity` defaults to **null**, which applies no floor, and
+that means the vector arm returns the K nearest items to *any* query —
+including a query about something entirely absent from memory. A nearest-K
+query has no notion of "close enough". The K-th neighbour is returned whether
+its similarity is 0.9 or 0.02.
+
+That behaviour is correct for a build whose floor has not been calibrated yet,
+and wrong for one where it has. So:
+
+- **null** — no floor. Every search returns K results. The response says so.
+- **a number** — a floor, applied in SQL before the LIMIT so the top-K is not
+  filled with rows the caller discards.
+
+A floor of zero is a real floor and is *not* the same as no floor: it excludes
+the items most unlike the query, which is not the same as excluding nothing.
+The code distinguishes them, and so should any caller reading a response.
+
+What gets measured: for each recorded search, the distribution of similarities
+among returned items, and the point below which a human-labelled "irrelevant"
+item falls. The floor goes just above that, because the cost asymmetry favours
+it — a missing result is recoverable by asking again, and a buried one is not.
 
 ---
 
