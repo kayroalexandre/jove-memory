@@ -673,3 +673,135 @@ A named Docker volume was tried first and does not work: Docker creates one owne
 root, and the container runs as the host user so it can read a mode-600 file — so it
 cannot write its own key into it either. A host directory `npm run key:set` creates and
 owns is the arrangement that works without an entrypoint running as root.
+
+---
+
+## Phase 7 notes: media, and six things only running it revealed
+
+### SigV4 signing: the port, and a chain that compiled and then threw
+
+The first `put` failed with `.update is not a function`. The key derivation was written as
+a single chained expression whose `reduce` had already called `.digest()` — so the
+accumulator was a `Buffer`, and `Buffer` has no `update`. It compiled perfectly.
+
+The second failure was a 403 that looked like bad credentials. `new URL('http://minio').host`
+is `minio`, not `minio:9000`, and SigV4 covers the Host header — so a signature computed over
+a host that differs from the one connected to is rejected by a service that is otherwise
+being talked to correctly. A signature assertion that checks the port is worth the two
+minutes it costs.
+
+### An index on the embedding column cannot exist, and should not
+
+`0004_media.sql` originally carried a plain B-tree on `embedding`, mirroring the
+`memory_item_vectors` fallback:
+
+```
+ERROR:  index row requires 12320 bytes, maximum size is 8191
+```
+
+Which would have been the wrong index anyway. An exact search computes a distance per row and
+orders by it; nothing looks a vector up by equality, so a B-tree on the column is never
+consulted. HNSW is impossible above 2000 dimensions regardless. There is now **no index on
+the embedding column**, and the migration says why in place — an index that exists only to be
+ignored is worse than none, because it looks like the column is indexed.
+
+### `content_type_source` was silently the database default
+
+`sniffContentType` returns `{ contentType, source }`. The caller destructured
+`{ contentType, contentTypeSource }` — so the source was `undefined` on every upload, the
+column's `NOT NULL DEFAULT 'declared'` filled in, and **every type was recorded as
+declared**, including ones established from magic bytes.
+
+This is the most dangerous class of bug in the project so far, because it does not
+misbehave: the field is populated, it is just always wrong, and "wrong but populated" is
+exactly what a `NOT NULL` constraint appears to promise. It was found by printing the
+returned object rather than by reading the code, twice.
+
+### The extractor found no streams in an uncompressed PDF
+
+`extractStreams` matched `/Filter ... stream`, so a PDF with no filter — which is what
+"save plain" produces — yielded nothing and reported *"no text operators found"* while the
+text sat in the file in plain sight. Now every `stream…endstream` is found and the filter is
+read from the surrounding dictionary, optional or not.
+
+### The object key dropped the extension
+
+`base.endsWith(extension) ? "" : extension` meant a file that already had an extension got
+**no extension at all**: `photo.png` became `<hash>` with nothing after it, so a listing of
+the bucket said nothing about what any object was.
+
+And `../../etc/passwd.png` became `..-..-etc-passwd.png` — no slash, so not a traversal, and
+still a key that reads as one and would defeat a prefix-scoped policy written by eye. Dot-runs
+now collapse.
+
+### A network failure reported `fetch failed` and nothing else
+
+The cause — `ECONNREFUSED`, a DNS failure, a TLS error — lives in `err.cause`. Reporting only
+the wrapper turns a configuration problem into a mystery, and the message did not even name
+the endpoint it failed to reach.
+
+### Sniffing, and what a filename is worth
+
+Three sources, in descending order of trust, and the recorded source says which:
+
+| `content_type_source` | Means |
+| --- | --- |
+| `sniffed` | the bytes have a magic number that says what they are |
+| `extension` | the bytes are unrecognised and the filename claims a known type |
+| `declared` | neither, and the caller said so |
+| `unknown` | nothing was known |
+
+A file that claims `image/png` and starts with `%PDF-` is recorded as a PDF with
+`typeMismatch: "declared image/png, bytes are application/pdf"`. Which one is right depends
+on why the file was named that, and that is not knowable from the bytes — so it is reported
+rather than resolved.
+
+## Running the gate
+
+```bash
+docker compose exec minio sh -c 'mc alias set local http://127.0.0.1:9000 \
+  "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" && mc mb -p local/jove-media'
+
+docker compose run --rm --entrypoint sh api -c \
+  'OPENROUTER_API_KEY=$(cat /run/secrets/jove/openrouter.key) node scripts/verify-media.mjs'
+```
+
+Inside the compose network, because MinIO publishes no host port and that is the point of it.
+The script generates its own PNG and PDF rather than shipping binary fixtures — a binary in a
+public repository is a binary nobody can review, and a fixture fetched at test time is a test
+that fails when a third party is down.
+
+25 checks, all passing against a real MinIO and a real PostgreSQL:
+
+```
+[pass] the bucket is reachable
+[pass] image uploaded
+[pass] the id is the sha256 of the bytes
+[pass] content type sniffed, not trusted
+[pass] image fetched back
+[pass] the fetched bytes are the uploaded bytes
+[pass] sha256 verified on read
+[pass] an ETag is recorded
+[pass] the ETag is not the proof — the sha256 is
+[pass] tampered bytes are refused
+[pass] and the refusal is a verification, not a read error
+[pass] re-uploading identical bytes is a no-op
+[pass] pdf uploaded
+[pass] text extracted
+[pass] the extraction found the document's own words
+[pass] page count read from the PDF
+[pass] a file that lies about being a PDF is not recorded as *sniffed*
+[pass] a PDF named .png is recorded from its bytes, with the mismatch flagged
+[pass] a text query retrieves the PDF
+[pass] a text query retrieves the image
+[pass] media and text share one embedding space
+[pass] media coverage is reported
+[pass] every media row verified against its bytes
+[pass] uploads are recorded
+[pass] media_mutations is append-only
+
+GATE MET
+```
+
+The corruption test tampers with the stored object and leaves the recorded hash alone, which
+is exactly what real corruption produces, and asserts the read is refused.

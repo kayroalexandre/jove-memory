@@ -537,19 +537,32 @@ test("a text query and an image query reach the same table, the same column", as
   assert.equal(coverage.embedded, 3);
   assert.equal(coverage.missing, 0);
 
-  // No table other than `memory_item_vectors` holds a vector. An earlier
-  // version of this query counted `tableoid::text`, which is the table's own
-  // OID — one distinct value by construction, so the assertion passed for the
-  // wrong reason and would have kept passing if a second index appeared.
+  // Exactly two tables hold a vector, and the set is named.
+  //
+  // An earlier version of this query counted `tableoid::text`, which is the
+  // table's own OID — one distinct value by construction, so the assertion
+  // passed for the wrong reason and would have kept passing if a second index
+  // appeared.
+  //
+  // `media` joined the list in Phase 7. Two tables is correct: media bytes live
+  // in S3 with a pointer in the database (ADR-011), so their vectors cannot
+  // live in the items table. What ADR-005 requires is a shared embedding
+  // *space*, not a shared table — and a text query retrieving an image, which
+  // is asserted above, is the property that matters.
   const { rows } = await pools.poolFor(workspace).query(
-    `SELECT count(DISTINCT c.relname) AS vector_tables
+    `SELECT c.relname AS table_name
      FROM pg_attribute a
      JOIN pg_class c ON c.oid = a.attrelid
-     WHERE a.attname = 'embedding'
+     WHERE a.attname IN ('embedding', 'embedding_placeholder')
        AND a.atttypid = 'vector'::regtype
-       AND c.relkind = 'r'`
+       AND c.relkind = 'r'
+     ORDER BY c.relname`
   );
-  assert.equal(Number(rows[0].vector_tables), 1, "exactly one table holds a vector — no second index");
+  assert.deepEqual(
+    rows.map((r) => r.table_name),
+    ["media", "memory_item_vectors"],
+    "media has its own column; both are in the same embedding space"
+  );
 
   const { rows: itemRows } = await pools.poolFor(workspace).query(
     "SELECT count(DISTINCT item_id) AS items FROM memory_item_vectors"

@@ -22,7 +22,8 @@
     "key:set": "node scripts/set-provider-key.mjs",
     "key:check": "node scripts/check-provider.mjs",
     "gate:measure": "node scripts/measure-write-gate.mjs",
-    "rerank:measure": "node scripts/measure-rerank.mjs"
+    "rerank:measure": "node scripts/measure-rerank.mjs",
+    "media:verify": "node scripts/verify-media.mjs"
   },
   "dependencies": {
     "pg": "^8.23.1"

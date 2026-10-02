@@ -1157,6 +1157,217 @@ export function createStore({ workspace, pools, logger = null, clock = () => new
     },
 
     // -----------------------------------------------------------------------
+    // Media
+    //
+    // The bytes live in S3. This table is a pointer, a hash, and the extracted
+    // text — never the content itself (ADR-011).
+    // -----------------------------------------------------------------------
+
+    /**
+     * Record an uploaded media object.
+     *
+     * Idempotent on (workspace, id), which is the sha256 of the bytes. Two
+     * uploads of the same file are one row, because a memory system that
+     * stores the same image twice retrieves it twice.
+     */
+    async upsertMedia(media) {
+      const {
+        id,
+        bucket,
+        objectKey,
+        sha256,
+        etag = null,
+        contentType,
+        contentTypeSource = "declared",
+        sizeBytes,
+        extractedText = null,
+        extractionMethod = null,
+        extractionError = null,
+        caption = null,
+        itemId = null
+      } = media;
+
+      const { rows } = await pools.poolFor(workspace).query(
+        `INSERT INTO media
+           (id, workspace, bucket, object_key, sha256, etag, content_type,
+            content_type_source, size_bytes, extracted_text, extraction_method,
+            extraction_error, caption, item_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+         ON CONFLICT (workspace, id) DO UPDATE SET
+           etag = EXCLUDED.etag,
+           content_type = EXCLUDED.content_type,
+           content_type_source = EXCLUDED.content_type_source,
+           size_bytes = EXCLUDED.size_bytes,
+           extracted_text = EXCLUDED.extracted_text,
+           extraction_method = EXCLUDED.extraction_method,
+           extraction_error = EXCLUDED.extraction_error,
+           caption = COALESCE(EXCLUDED.caption, media.caption),
+           updated_at = now()
+         RETURNING *`,
+        [
+          id, workspace, bucket, objectKey, sha256, etag, contentType,
+          contentTypeSource, sizeBytes, extractedText, extractionMethod,
+          extractionError, caption, itemId
+        ]
+      );
+      return rows[0] ?? null;
+    },
+
+    async readMedia(id) {
+      const { rows } = await pools.poolFor(workspace).query(
+        "SELECT * FROM media WHERE workspace = $1 AND id = $2",
+        [workspace, id]
+      );
+      return rows[0] ?? null;
+    },
+
+    async findMediaByHash(sha256) {
+      const { rows } = await pools.poolFor(workspace).query(
+        "SELECT * FROM media WHERE workspace = $1 AND sha256 = $2",
+        [workspace, sha256]
+      );
+      return rows[0] ?? null;
+    },
+
+    async listMedia({ limit = 100, offset = 0, itemId = null, unextractedOnly = false } = {}) {
+      const conditions = ["workspace = $1"];
+      const values = [workspace];
+
+      if (itemId) {
+        values.push(itemId);
+        conditions.push(`item_id = $${values.length}`);
+      }
+      if (unextractedOnly) conditions.push("(extracted_text IS NULL AND extraction_error IS NULL)");
+
+      values.push(limit, offset);
+      const { rows } = await pools.poolFor(workspace).query(
+        `SELECT id, content_type, size_bytes, sha256, extraction_method, extraction_error,
+                caption, item_id, created_at
+         FROM media
+         WHERE ${conditions.join(" AND ")}
+         ORDER BY created_at DESC
+         LIMIT $${values.length - 1} OFFSET $${values.length}`,
+        values
+      );
+      return rows;
+    },
+
+    async attachMediaToItem(mediaId, itemId) {
+      const { rows } = await pools.poolFor(workspace).query(
+        "UPDATE media SET item_id = $3, updated_at = now() WHERE workspace = $1 AND id = $2 RETURNING id, item_id",
+        [workspace, mediaId, itemId]
+      );
+      return rows[0] ?? null;
+    },
+
+    async upsertMediaEmbedding(mediaId, model, vector) {
+      const { rows } = await pools.poolFor(workspace).query(
+        `UPDATE media SET embedding_model = $3, embedding = $4::vector, updated_at = now()
+         WHERE workspace = $1 AND id = $2 RETURNING id, embedding_model`,
+        [workspace, mediaId, model, toVectorLiteral(vector)]
+      );
+      return rows[0] ?? null;
+    },
+
+    /**
+     * The vector arm for media.
+     *
+     * Media items can be relevant to a query, and they are in the same
+     * embedding space as everything else (ADR-005) — which is why a text query
+     * can retrieve an image. `item_id IS NOT NULL` excludes media that has not
+     * been attached to a memory yet: bytes that exist but belong to nothing are
+     * not recallable content.
+     */
+    async searchMedia(vector, { limit = 20, model = null, minSimilarity = null } = {}) {
+      const literal = toVectorLiteral(vector);
+      const values = [literal];
+      const conditions = ["item_id IS NOT NULL"];
+
+      if (model) {
+        values.push(model);
+        conditions.push(`embedding_model = $${values.length}`);
+      }
+      if (minSimilarity !== null) {
+        values.push(minSimilarity);
+        conditions.push(`1 - (embedding <=> $1::vector) >= $${values.length}`);
+      }
+
+      const { rows } = await pools.poolFor(workspace).query(
+        `SELECT id, caption, content_type, size_bytes, item_id,
+                1 - (embedding <=> $1::vector) AS similarity
+         FROM media
+         WHERE ${conditions.join(" AND ")}
+         ORDER BY embedding <=> $1::vector
+         LIMIT $${values.length + 1}`,
+        [...values, limit]
+      );
+
+      return rows.map((row) => ({
+        id: row.id,
+        media: row,
+        similarity: Number(row.similarity)
+      }));
+    },
+
+    /** Media whose embedding is missing, and which is attached to something. */
+    async listUnembeddedMedia({ model, limit = 100 } = {}) {
+      const { rows } = await pools.poolFor(workspace).query(
+        `SELECT id, caption, content_type, extracted_text
+         FROM media
+         WHERE embedding IS NULL
+           AND item_id IS NOT NULL
+           AND ($1::text IS NULL OR embedding_model IS DISTINCT FROM $1)
+         ORDER BY created_at DESC
+         LIMIT $2`,
+        [model, limit]
+      );
+      return rows;
+    },
+
+    async mediaCoverage({ model } = {}) {
+      const { rows } = await pools.poolFor(workspace).query(
+        `SELECT
+           count(*) FILTER (WHERE item_id IS NOT NULL)::int AS attached,
+           count(embedding) FILTER (WHERE item_id IS NOT NULL)::int AS embedded,
+           count(*) FILTER (WHERE item_id IS NULL)::int AS unattached
+         FROM media`
+      );
+      const attached = Number(rows[0]?.attached ?? 0);
+      const embedded = Number(rows[0]?.embedded ?? 0);
+      return {
+        attached,
+        embedded,
+        unattached: Number(rows[0]?.unattached ?? 0),
+        ratio: attached === 0 ? null : Number((embedded / attached).toFixed(4))
+      };
+    },
+
+    async recordMediaMutation({ mediaId, operation, sizeBytes = null, sha256 = null, note = null }) {
+      await pools.poolFor(workspace).query(
+        `INSERT INTO media_mutations (workspace, media_id, operation, size_bytes, sha256, note)
+         VALUES ($1,$2,$3,$4,$5,$6)`,
+        [workspace, mediaId, operation, sizeBytes, sha256, note]
+      );
+    },
+
+    async listMediaMutations({ limit = 100, mediaId = null } = {}) {
+      const values = [workspace];
+      const conditions = ["workspace = $1"];
+      if (mediaId) {
+        values.push(mediaId);
+        conditions.push(`media_id = $${values.length}`);
+      }
+      values.push(limit);
+
+      const { rows } = await pools.poolFor(workspace).query(
+        `SELECT * FROM media_mutations WHERE ${conditions.join(" AND ")}
+         ORDER BY at DESC LIMIT $${values.length}`,
+        values
+      );
+      return rows;
+    },
+
+    // -----------------------------------------------------------------------
     // Search accounting
     // -----------------------------------------------------------------------
 
