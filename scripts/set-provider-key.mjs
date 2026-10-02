@@ -29,8 +29,8 @@
 
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { join } from "node:path";
 
 import { keyDirectoryCandidates } from "../src/config.mjs";
 import { secureDirectory, secureWriteFile, InsecureFileError } from "./lib/secure-file.mjs";
@@ -52,8 +52,48 @@ function out(text) {
   process.stdout.write(text);
 }
 
-/** Read one line from the TTY with echo disabled. */
+/**
+ * Read one line from the terminal with echo disabled.
+ *
+ * The TTY is checked first and a missing one is named as a missing TTY. That
+ * check is the improvement: without it, `read -rs` returns immediately with
+ * nothing, the key arrives empty, and the only symptom is "the value was empty
+ * — nothing was pasted", which sends the reader looking for a paste problem
+ * rather than the real one.
+ *
+ * The read itself is still `bash -c 'read -rs'`. A Node readline replacement
+ * was tried and abandoned: readline wants a real writable output to attach to,
+ * and there is none, because the point is that nothing is printed. The stub it
+ * was given lacked the `on` method readline calls, and the failure surfaced as
+ * `output.on is not a function` at exactly the moment the user was about to
+ * paste. A hand-rolled raw-mode reader worked but could not be exercised in a
+ * non-interactive environment, and shipping a credential prompt that has only
+ * been run by the person who wrote it is worse than one known to work.
+ */
 function promptHidden(prompt) {
+  // Checked first, and reported as a missing TTY.
+  //
+  // Without a terminal on stdin, `read -rs` returns immediately with nothing
+  // and the only symptom is "the value was empty — nothing was pasted", which
+  // sends the reader looking for a paste problem rather than the real one.
+  if (!process.stdin.isTTY) {
+    out(
+      "\n  stdin is not a terminal, so the key cannot be read without echoing it.\n" +
+        "  Run this command directly in an interactive shell — not through a pipe,\n" +
+        "  not with output redirection, and not from an editor's task runner.\n" +
+        "  Pasting the key into a shell command instead would put it in your\n" +
+        "  shell history, which is the thing this script exists to avoid.\n\n"
+    );
+    process.exit(1);
+  }
+
+  // `read -rs` in a subshell, not a Node readline.
+  //
+  // An attempt to replace this with `readline` failed: readline wants a real
+  // writable output to attach to, and there is none, because the point is that
+  // nothing is printed. The stub it was given lacked the `on` method readline
+  // calls, and the failure appeared as `output.on is not a function` at exactly
+  // the moment the user was about to paste.
   const result = spawnSync(
     "bash",
     ["-c", 'IFS= read -rs -p "$1" _jove_key; printf "%s" "$_jove_key"', "bash", prompt],
@@ -61,7 +101,10 @@ function promptHidden(prompt) {
   );
 
   if (result.error || result.status !== 0) {
-    out("\nCould not read from the terminal. Run this directly in a shell, not through a pipe.\n");
+    out(
+      "\n  Could not read from the terminal. Run this directly in an " +
+        "interactive shell,\n  not through a pipe.\n\n"
+    );
     process.exit(1);
   }
   return result.stdout.trim();
@@ -167,8 +210,10 @@ out("  written inside the repository. Nothing is sent over the network.\n\n");
 out(`  current    ${describeExisting(dir)}\n\n`);
 out("  Paste the key and press enter (nothing will be shown): ");
 
+process.stdin.setRawMode?.(false);
+
 for (let attempt = 1; attempt <= 3; attempt += 1) {
-  const key = promptHidden("");
+  const key = await promptHidden("");
   out("\n");
 
   const problem = validate(key);
