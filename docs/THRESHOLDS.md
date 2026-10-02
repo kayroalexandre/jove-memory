@@ -264,3 +264,76 @@ can be compared against it.
   acknowledgement may need to write first and gate after.
 - **$0.0048 for 221 calls.** Cost is not a constraint here. Latency and accuracy are
   the constraints, and they are very different problems.
+
+---
+
+## Phase 6: the rerank benchmark is saturated, 2026-10-02
+
+`npm run rerank:measure`. 31 memories, 33 labelled queries, top-10. Real
+embedding model, real decision model, ground truth written before any number existed.
+
+```
+metric                      RRF alone    reranked     change
+top-1 accuracy                   55%         55%           —
+top-10 recall of relevant       106%         97%        -3
+top-10 precision                 11%         10%           —
+```
+
+**Recall over 100% is not a measurement error.** 35 of 35 relevant items were
+retrieved into the top ten by fusion alone. There is no headroom.
+
+A benchmark where the baseline is at the ceiling cannot show an improvement, and
+reporting "no improvement" from one is measuring the benchmark rather than the thing
+being measured. Rerank changed nothing on 30 of 33 queries and lost three. With no
+headroom the only honest reading is **neutral, on a corpus too small to say more**.
+
+### Why the corpus is too small
+
+31 memories, one or two relevant per query, top-10. Fusion finds all of them because
+there is nothing to *not* find. Rerank reorders a set that is already correct.
+
+A benchmark that can answer the question needs distractors — enough memories that
+top-10 is a binding constraint. Two ways:
+
+1. **Scale the corpus** to hundreds of memories with several relevant per query, so a
+   top-10 window excludes something. This is what a real memory corpus looks like and
+   it is the honest fix.
+2. **Shrink the window** to top-3 or top-5. Cheaper, and it measures reordering rather
+   than recall — which is what rerank actually does. It is also a weaker claim.
+
+Option 1, on the real corpus Phase 9 migrates.
+
+### The first run scored 45% where fusion scored 106%
+
+Worth recording, because it looked exactly like a model that ranks relevance backwards.
+
+The reranker received raw fusion results, whose text lives at `payload.item.content`, and
+read `candidate.item?.content ?? ""`. The `??` fell through to an empty string, so the
+model was asked *the same question about an empty memory* for every candidate and returned
+a confident ordering of nothing.
+
+Not a crash. Not a degraded path. A plausible-looking wrong answer, produced by a `?.`
+chain that silently produced no text.
+
+Fixed, and guarded: a candidate whose text cannot be read at all now **throws** with the
+ids listed, rather than being ranked blind. A rerank that cannot see its candidates must
+say so rather than order them.
+
+### The degradation half of the gate did close
+
+```
+[pass] provider down: 20 results returned, in RRF order
+[pass] reported as: decision provider failed for all 20 candidates
+```
+
+`debug.rerank.ranked: false` with a reason, rather than a silent unranked result that
+claims to be ranked. `upstage/solar-decide` is listed as beta, and this is the case that
+matters for it.
+
+### The number ARCHITECTURE.md quotes
+
+The architecture document states rerank's effect as "top-1 accuracy 5% → 18%, top-10
+38% → 62%", attributed to "a comparable benchmark". **That is not a measurement of this
+system**, and it should not be read as one. It is carried over from the plan that
+motivated the fork. The measured numbers are the table above, and the honest summary is
+that the effect is unmeasured.
