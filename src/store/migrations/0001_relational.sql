@@ -146,10 +146,23 @@ CREATE TRIGGER memory_mutations_no_update
 -- ---------------------------------------------------------------------------
 -- Embeddings.
 --
--- Phase 1 stores vectors as JSONB. That is deliberate and temporary: Phase 3
--- migrates this table to `vector(N)` with an HNSW index. Storing JSONB now
--- keeps Phase 1 free of a dependency on the Phase 3 dimension decision, so
--- each phase is testable on its own.
+-- Phase 1 stored vectors as JSONB so that it stayed free of a dependency on
+-- the dimension decision, and each phase was testable on its own.
+--
+-- What Phase 3 actually did, rather than what this comment originally claimed:
+-- it did NOT migrate this table. It added a separate `memory_item_vectors`
+-- with a real `vector(3072)` column and left this one alone. Two tables, two
+-- jobs:
+--
+--   memory_item_vectors — per-item search vectors, in a column, queryable
+--                         with a distance operator.
+--   memory_embeddings   — this one. A content-addressed cache keyed by text
+--                         hash, for anything embedded that is not an owned
+--                         item: a query, a node summary, a rerank candidate.
+--                         No item, no node, no cascade.
+--
+-- JSONB here is therefore not temporary. A query vector has no item row to
+-- hang off, and this is where it lives.
 --
 -- The primary key is (cache_key, model), carried over from upstream: two models
 -- can hold different vectors for the same text, and neither can overwrite the

@@ -268,6 +268,15 @@ test("only the store directory writes SQL", () => {
       const content = readFileSync(path, "utf8");
       if (/\b(SELECT|INSERT INTO|UPDATE\s+\w+\s+SET|DELETE FROM)\b/.test(content)) {
         offenders.push(path);
+        continue;
+      }
+
+      // store.mjs exposes a raw `pool()` for its two siblings, which is how
+      // those get their statements without importing pg themselves. A caller
+      // outside the directory reaching for it is the same violation as writing
+      // the query inline, so the escape hatch is closed as well.
+      if (/\.pool\(\)/.test(content)) {
+        offenders.push(path);
       }
     }
   };
@@ -276,8 +285,9 @@ test("only the store directory writes SQL", () => {
   assert.deepEqual(
     offenders,
     [],
-    `SQL over memory data found outside src/store/: ${offenders.join(", ")}. Queries ` +
-      `about memories belong to the store; everything above it calls methods.`
+    `SQL access outside src/store/: ${offenders.join(", ")}. Queries about memories ` +
+      `belong to the store; everything above it calls methods. store.pool() exists ` +
+      `for migrate.mjs and pool.mjs only.`
   );
 });
 
@@ -295,6 +305,76 @@ test("store.mjs does not overstate its own scope", () => {
     store,
     /only module that writes (SQL|queries)/i,
     "store.mjs must still state the invariant, scoped accurately"
+  );
+});
+
+test("the embedding client has no local fallback path", () => {
+  // ADR-009, asserted against the module that does the embedding rather than
+  // against package.json alone. The first version of this test only checked
+  // dependencies, which would have passed if someone added a local fallback
+  // inline — reading a model file, or shelling out to a Python process.
+  const client = readFileSync("src/embedding/openrouter.mjs", "utf8");
+
+  // Every embedding path goes through a fetch. No `require`, no dynamic import
+  // of a model runtime, no child process.
+  assert.ok(
+    !/import\s*\(|require\s*\(|child_process|execSync|spawnSync|readFile/i.test(client),
+    "the embedding client must not load anything local — ADR-009 forbids a local " +
+      "model runtime, and an inline import is how that would arrive unannounced"
+  );
+
+  // And the failure path says so, because "the key is missing" and "the key is
+  // wrong" lead to different actions by the reader.
+  assert.match(
+    client,
+    /ADR-009/,
+    "the no-key error must state that there is no local fallback"
+  );
+});
+
+test("a missing key is a runtime error, never a silent degradation", () => {
+  // Phase 2's finding, kept as an invariant. A build with no key must still
+  // start and serve health, but every *use* must fail loudly.
+  const config = readFileSync("src/config.mjs", "utf8");
+  const embedLine = config.match(/apiKey: optional\("OPENROUTER_API_KEY", ""\)/);
+  assert.ok(embedLine, "the key must be optional at boot, or the stack cannot start without one");
+
+  const client = readFileSync("src/embedding/openrouter.mjs", "utf8");
+  assert.match(
+    client,
+    /if \(!config\.providers\.apiKey\)/,
+    "the client must check for the key and throw rather than sending a request that will 401"
+  );
+
+  const search = readFileSync("src/retrieval/search.mjs", "utf8");
+  assert.match(
+    search,
+    /semantic_configured/,
+    "search responses must distinguish 'not configured' from 'failed'"
+  );
+});
+
+test("the width check happens before anything is written", () => {
+  // The failure that never surfaces as an error. A 1536-wide vector in a 3072
+  // column either gets stored and produces nonsense distances, or is rejected
+  // by pgvector three layers away with a message that names neither the text
+  // nor the model.
+  const client = readFileSync("src/embedding/openrouter.mjs", "utf8");
+  assert.match(client, /assertDimensions/, "the client must validate width");
+  assert.match(
+    client,
+    /expectedDimensions/,
+    "and the expected width must come from config, not be hardcoded"
+  );
+
+  // Every vector written to the item index goes through the store method, which
+  // is where the literal is built and validated.
+  const store = readFileSync("src/store/store.mjs", "utf8");
+  assert.match(store, /toVectorLiteral/);
+  assert.match(
+    store,
+    /Number\.isFinite/,
+    "a NaN or Infinity in a vector produces one that matches nothing, silently"
   );
 });
 
