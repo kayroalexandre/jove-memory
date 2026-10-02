@@ -108,7 +108,12 @@ export function loadConfig(env = process.env) {
       embedding: {
         // 3072 for gemini-embedding-2. The schema is created at this width, so
         // changing it means re-embedding everything (ADR-005).
-        dimensions: int("PARADIGM_EMBED_DIMENSIONS", 3072)
+        dimensions: int("PARADIGM_EMBED_DIMENSIONS", 3072),
+        // Texts per HTTP request. Not a tuning knob for speed: it is a request
+        // size, and one 100-item batch that gets rejected costs more than ten
+        // accepted ones. 32 keeps a batch well inside every provider's limit
+        // while still amortising the round trip.
+        batchSize: int("PARADIGM_EMBED_BATCH_SIZE", 32)
       }
     };
   } finally {

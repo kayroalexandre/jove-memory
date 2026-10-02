@@ -103,6 +103,14 @@ this fork called for it. It sends `input_type` (`query` or `passage`), which the
 OpenAI-compatible path does not, so it has its own adapter rather than being forced through
 the generic one.
 
+`input_type` is a **per-request** field, not a per-input one, which has a consequence worth
+stating: a batch mixing queries and passages cannot be sent in a single request. The client
+refuses such a batch rather than picking one type for all of it, because embedding documents
+as queries is a systematic error that looks like mediocre ranking and is reported by nothing.
+The same string embedded as a query and as a passage lands in meaningfully different places —
+which is why `embedImage` and `embedText` both pass `inputType: "query"`, and why the ingestor
+does not.
+
 ### Embedding: `google/gemini-embedding-2`
 
 | Property | Value |
@@ -122,6 +130,14 @@ the migration surface, and needs a query classifier to pick between them.
 re-embedding everything, because Gemini Embedding 2 and Voyage Multimodal 3.5 do not share a
 vector space. Model choice is therefore a Phase 9 decision, not a runtime toggle.
 
+**Enforced, not documented.** The client refuses any vector whose width disagrees with the
+column, naming the model, both widths, and the offending text. This is the failure that never
+surfaces as an error: a wrong-width vector in a `vector(3072)` column either gets stored and
+produces nonsense distances that read as mediocre ranking, or is rejected by pgvector three
+layers away with a message naming neither the text nor the model. A base64 string where floats
+were requested is refused for the same reason — decoded as a float array it gives numbers of the
+wrong length, which is plausible-looking and wrong.
+
 **The cost of 3072 dimensions, measured:** pgvector 0.8.6 refuses an HNSW index above 2000
 dimensions.
 
@@ -139,9 +155,29 @@ would permit HNSW. That is a data migration rather than a config edit, so it is 
 make when the corpus needs it rather than in advance. Recorded in `0002_retrieval.sql` next to
 the absence, so the next person does not assume it was forgotten.
 
-**Fallback:** if the model is unavailable, the system degrades to BM25-only retrieval and
-reports it in the `debug` block of the search response. It does not silently return worse
-results without saying so.
+**Fallback:** if the model is unavailable, the system degrades to retrieval on the other three
+layers and reports it. Two separate fields, because the two cases need opposite reactions:
+
+| State | `debug.semantic_error` | `debug.semantic_configured` | Reaction |
+| --- | --- | --- | --- |
+| Working | `null` | `true` | — |
+| Key issued, provider down | the cause | `true` | Retry, alert — something is broken |
+| No key | `null` | `false` | Nobody has issued a key yet |
+
+Reporting the third as an error would train a reader to ignore the second.
+
+The health check never probes the provider. It reports whether a key is *present*, and never
+whether it works: a liveness probe that embeds a test string spends money and burns rate-limit on
+every container restart, and every orchestrator schedules those. The first real use is what
+proves the key, and a failure there is reported by the search that hit it.
+
+**Writes do not depend on it.** An item is stored whether or not it can be embedded. A memory
+with no vector is still a memory, and blocking a write on a provider blip would lose the thing
+the user asked to remember. `embedItem` returns a result object rather than throwing, because a
+write path needs to know the write succeeded and the embed did not — two separate facts. Index
+completeness is reported under `indexing` in the health response, deliberately outside
+`dependencies`: a corpus that is 30% unembedded retrieves perfectly well on three layers, and
+calling it degraded would make `/health` noisy.
 
 ### Inference: `qwen/qwen3.8-flash`
 
@@ -276,10 +312,11 @@ rather than feature appeal.
 | Module | Responsibility | Depends on |
 | --- | --- | --- |
 | `store/` | Postgres access, migrations | pg only |
+| `embedding/` | OpenRouter client: batching, caching, retries | config only |
 | `retrieval/` | The four arms, RRF | `store/`, embedder |
 | `decisions/` | Decision model client, calibration | decision provider only |
-| `ingest/` | Chunking, extraction, media | store, embedder, inference |
-| `consolidate/` | Propose, execute, invalidate | decisions, inference |
+| `ingest/` | Chunking, extraction, media | `store/`, `embedding/`, inference |
+| `consolidate/` | Propose, execute, invalidate | `decisions/`, inference |
 | `mcp/` | Tool surface | everything above |
 | `api/` | REST surface | everything above |
 

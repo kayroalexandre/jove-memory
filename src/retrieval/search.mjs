@@ -67,10 +67,26 @@ export function createSearcher({ store, logger = null, weights = DEFAULT_WEIGHTS
     const started = Date.now();
     const trimmed = String(query ?? "").trim();
 
+    /**
+     * The text the non-vector arms work from.
+     *
+     * For an image query that is the caption, not the empty `query`. A
+     * caption is real text with real vocabulary, and running the lexical and
+     * graph arms against it is the difference between a picture search using
+     * three layers and one using one.
+     */
+    const lexicalQuery = trimmed || (options.caption ? String(options.caption).trim() : "");
+
     // An empty query is a listing, not a failed search. Returning an error
     // would make the caller guess, and running four arms against "" produces
     // four meaningless rankings.
-    if (!trimmed) {
+    //
+    // An image query has no text and is not a listing. The two are different
+    // requests that both arrive with an empty `query`, which is exactly the
+    // case that makes this check worth reading carefully: treating an image
+    // query as a listing would silently return nothing for every picture ever
+    // uploaded, and nothing in the response would say why.
+    if (!trimmed && !options.imageUrl) {
       return emptyResult({
         query: trimmed,
         asOf,
@@ -85,6 +101,26 @@ export function createSearcher({ store, logger = null, weights = DEFAULT_WEIGHTS
     const status = {};
     const arms = {};
 
+    // A missing provider is not a provider failure. The distinction is the
+    // point of `semantic_error`: one means "we asked and it did not work", the
+    // other means "we never asked", and a caller reacting to the first (alert,
+    // retry, fail the request) would be wrong for the second.
+    const NOT_CONFIGURED = "no embedder: this build has no embedding provider";
+
+    /**
+     * How the vector arm gets its query vector.
+     *
+     * A closure rather than a branch, which is what lets a text query and an
+     * image query share every line below. An image is embedded in the *same*
+     * space as text (ADR-005), so from the vector arm's point of view the only
+     * difference is how the vector was produced — and the reason there is no
+     * image index to consult, no second embedding space, and no query
+     * classifier choosing between them.
+     */
+    const produceVector = options.imageUrl
+      ? () => embedImage(embed, options.imageUrl, options.caption ?? "")
+      : () => embedText(embed, trimmed);
+
     // -- Arms 1 and 2, in parallel ------------------------------------------
     //
     // Parallel because they are independent, and because they are the two that
@@ -92,8 +128,17 @@ export function createSearcher({ store, logger = null, weights = DEFAULT_WEIGHTS
     // database. Running them in series doubles the latency of every search.
 
     const [vectorOutcome, lexicalOutcome] = await Promise.all([
-      runVectorArm(embed, trimmed, { model: null }),
-      runArm("bm25", () => store.searchBm25(trimmed, { limit: armLimit, nodeId, tags }))
+      runVectorArm(produceVector, minSimilarity, armLimit),
+      // A query with no text has no lexical comparison to make. Skipping is
+      // honest; running the arm against an empty string would report hits from
+      // no comparison at all, which is the failure mode this whole `status`
+      // object exists to prevent.
+      lexicalQuery
+        ? runArm("bm25", () => store.searchBm25(lexicalQuery, { limit: armLimit, nodeId, tags }))
+        : {
+            results: [],
+            status: { ran: false, reason: "no text in the query to match lexically" }
+          }
     ]);
 
     arms.vector = vectorOutcome.results;
@@ -177,6 +222,11 @@ export function createSearcher({ store, logger = null, weights = DEFAULT_WEIGHTS
 
     const response = {
       query: trimmed,
+      // Present because `query: ""` on an image query reads as "the search
+      // did not happen". Naming the type says "no text" rather than "no
+      // query", and it is the field a client switches on to render a result
+      // set that came from a picture.
+      queryType: options.imageUrl ? "image" : "text",
       asOf: asOf instanceof Date ? asOf.toISOString() : (asOf ?? null),
       results: results.map((r) => ({
         item: r.payload.item ?? r.payload,
@@ -201,6 +251,36 @@ export function createSearcher({ store, logger = null, weights = DEFAULT_WEIGHTS
         // measuring, and Phase 6's rerank benchmark depends on knowing it.
         degraded: !allFourRan,
         allLayersRan: allFourRan && allFourReported,
+        /**
+         * The vector arm's failure, named as a single field.
+         *
+         * `null` means the semantic layer ran. Non-null means it did not, and
+         * the value says why in one place rather than requiring the reader to
+         * reconstruct it from `arms.vector`.
+         *
+         * This is the field Phase 4's gate greps for: a response containing
+         * `semantic_error` is a search that ran on three layers, whatever the
+         * result count looks like. Making it a named field is what turns
+         * "did the semantic layer work" from a judgement into a check.
+         *
+         * A missing provider is not a failure, so it is not reported as one.
+         * The two call for opposite responses: an error here means retry or
+         * page someone, an unconfigured provider means nobody has issued a key
+         * yet, and alerting about the second is how a real outage gets ignored
+         * as a known one.
+         */
+        semantic_error:
+          status.vector?.ran === false && status.vector.configured !== false
+            ? status.vector.reason
+            : null,
+        /**
+         * Whether an embedding provider is configured at all.
+         *
+         * Separate from `semantic_error` because "not configured" and "failed"
+         * need different reactions, and because this is a property of the
+         * deployment rather than of any one search.
+         */
+        semantic_configured: status.vector?.configured !== false,
         bm25Engine: await bm25EngineOf(store),
         embedModel: arms.vector[0]?.embedModel ?? null,
         vectorCoverage: await safeReport(() => store.vectorCoverage(), logger),
@@ -241,37 +321,43 @@ export function createSearcher({ store, logger = null, weights = DEFAULT_WEIGHTS
      *
      * Separated out because it is the only failure mode that is not a database
      * error, and the only one whose cost is money. A failure here is reported
-     * as a skipped arm and the search continues on three layers.
+     * as a skipped arm and the search continues on three layers (ADR-008).
+     *
+     * Takes a producer rather than a string, so a text query and an image
+     * query are the same code from here down.
      */
-    async function runVectorArm(embedder, text, { model }) {
-      if (!embedder) {
+    async function runVectorArm(produce, floor, limit) {
+      if (!embed) {
         return {
           results: [],
-          // The honest reason. "embedder not configured" is Phase 3's actual
-          // state — cloud embeddings arrive in Phase 4 — and saying so beats
-          // an empty list that looks like a failed query.
-          status: { ran: false, reason: "no embedder: this build has no embedding provider" }
+          // The honest reason. A build with no embedder configured is a real
+          // state — it is what CI runs, and what Phase 3 ran before the
+          // embedder existed — and saying so beats an empty list that looks
+          // like a failed query.
+          status: { ran: false, reason: NOT_CONFIGURED, configured: false }
         };
       }
       try {
-        const embedded = await embedder.embed([text], { model, inputType: "query" });
-        const vector = Array.isArray(embedded?.[0]) ? embedded[0] : embedded;
+        const vector = await produce();
         if (!Array.isArray(vector)) {
-          return { results: [], status: { ran: false, reason: "embedder returned no vector" } };
+          return { results: [], status: { ran: false, reason: "embedder returned no vector", configured: true } };
         }
         const found = await store.searchVector(vector, {
-          limit: armLimit,
-          model: embedded.model ?? null,
-          minSimilarity
+          limit,
+          // The active model's vectors only. Filtering by model is what stops
+          // an index holding two models' vectors from returning distances
+          // between incomparable numbers (ADR-005).
+          model: embed.model ?? null,
+          minSimilarity: floor
         });
-        return { results: found, status: { ran: true, reason: null } };
+        return { results: found, status: { ran: true, reason: null, configured: true } };
       } catch (err) {
         // A provider outage degrades retrieval and does not fail the search
         // (ADR-008). The reason is recorded so the degradation is diagnosable
         // rather than mysterious.
         return {
           results: [],
-          status: { ran: false, reason: `embedding failed: ${err.message}` }
+          status: { ran: false, reason: `embedding failed: ${err.message}`, configured: true }
         };
       }
     }
@@ -297,6 +383,48 @@ export function createSearcher({ store, logger = null, weights = DEFAULT_WEIGHTS
   }
 
   return { search };
+}
+
+/**
+ * Produce a query vector from text.
+ *
+ * `input_type: "query"` is not decoration. Several embedding models are
+ * asymmetric: the same string embedded as a query and as a passage lands in
+ * meaningfully different places, and retrieving a corpus with a passage-shaped
+ * query vector is a systematic error that looks like mediocre ranking rather
+ * than a bug.
+ *
+ * The model decides whether it wants this. `google/gemini-embedding-2` ignores
+ * it; NVIDIA's `nemotron-3-embed-1b` requires it, taking `query` or `passage`.
+ */
+async function embedText(embedder, text) {
+  const embedded = await embedder.embed([text], { inputType: "query" });
+  return embedded[0];
+}
+
+/**
+ * Produce a query vector from an image, with optional caption.
+ *
+ * The caption and the image go in the same request, so the result is a joint
+ * embedding rather than two separate ones averaged afterwards. That matters:
+ * averaging two vectors from the same space is not the same as embedding the
+ * pair jointly, and the API supports the joint form directly.
+ *
+ * No caption means the request is image-only, which the API accepts — the
+ * content array needs at least one part, and an image is one.
+ */
+async function embedImage(embedder, imageUrl, caption) {
+  const parts = [];
+  if (caption) parts.push({ type: "text", text: caption });
+  parts.push({ type: "image_url", image_url: { url: imageUrl } });
+
+  if (typeof embedder.embedContent !== "function") {
+    throw new Error(
+      "The configured embedder has no embedContent(). An image query needs the " +
+        "multimodal path, and there is no local fallback (ADR-009)."
+    );
+  }
+  return embedder.embedContent(embedder.contentInput(parts), { inputType: "query" });
 }
 
 /** Which lexical engine is actually installed. Never assumed, never silent. */
@@ -335,6 +463,7 @@ function hashQuery(query) {
 function emptyResult({ query, asOf, tookMs, reason, weights }) {
   return {
     query,
+    queryType: "text",
     asOf: asOf instanceof Date ? asOf.toISOString() : (asOf ?? null),
     results: [],
     debug: {
@@ -344,6 +473,11 @@ function emptyResult({ query, asOf, tookMs, reason, weights }) {
       ),
       degraded: true,
       allLayersRan: false,
+      // An empty query is not a semantic failure. Nothing was embedded
+      // because nothing was asked, and reporting it as an error would make the
+      // gate for "the semantic layer worked" impossible to read.
+      semantic_error: null,
+      semantic_configured: true,
       tookMs
     }
   };

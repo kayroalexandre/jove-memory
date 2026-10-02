@@ -34,6 +34,25 @@ a constant chosen in advance.
 | `cross_workspace` | Whether another workspace is consulted | Context bleeds across workspaces | Useful cross-workspace context never surfaces |
 | `min_similarity` | The vector arm's distance floor | Every search returns K results, so "nothing relevant is stored" and "the index is broken" look identical | Relevant memories are dropped because they sit just under the floor |
 
+### A fourth number that is not a threshold at all
+
+`batch_size` (32) is in the same file because it is the other number people will
+want to tune, and because the honest reason not to is worth writing down. It
+controls how many texts go in one HTTP request. Lowering it is not faster — it
+is more round trips for the same work. Raising it past a provider's limit gets
+the whole request rejected, which costs more than any number of successful
+batches would have. The only reason to change it is a provider limit this
+build has not been told about, and the right response to that is to raise it
+to the documented ceiling rather than to experiment.
+
+`embed_dimensions` is here for a different reason and is **not** tunable at
+runtime. It is the width of the `vector(3072)` column created in migration
+0002. Changing it is a data migration — re-embed every memory — because
+`google/gemini-embedding-2` and any successor do not share a vector space
+(ADR-005). The client refuses to store a vector of any other width, naming the
+model and the offending text, precisely so that "someone edited the config"
+cannot become "search returns plausible nonsense".
+
 ### On `min_similarity` specifically
 
 This one is not a decision-model question, so the pipeline in the next section

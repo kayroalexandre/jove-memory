@@ -6,27 +6,53 @@ import { createPoolManager } from "../store/pool.mjs";
 import { createStore } from "../store/store.mjs";
 import { assertSchemaVersion, expectedVersion } from "../store/migrate.mjs";
 import { SHARED_WORKSPACE } from "../store/workspace-name.mjs";
+import { createEmbedder } from "../embedding/openrouter.mjs";
 
 /**
  * HTTP server: health and the workspace registry.
  *
- * Phase 2 delivers only what the compose stack needs to prove it comes up
- * clean — a health endpoint that reports each dependency separately, and
- * enough of a surface to provision and inspect workspaces. The memory API
- * proper arrives in Phase 10.
+ * Phase 2 delivered what the compose stack needs to prove it comes up clean.
+ * Phase 4 adds the one thing that reads outside this machine: an embedder, so
+ * health can report index completeness without spending a request to find out.
  *
  * The health endpoint deliberately does not fail when a model provider is down.
  * Degraded retrieval is still useful service, and a container that restarts
  * because a third-party API had a bad minute turns a small problem into an
  * outage (ADR-008).
+ *
+ * Module-level construction, because the import of this file *is* the server
+ * and every other module in the project follows the same shape. Tests build
+ * their own instances through `createApp`.
  */
 
 const config = loadConfig();
 const logger = createLogger({ level: config.server.logLevel });
 const pools = createPoolManager(config, { logger });
 
-/** Build the app without starting it, so tests can drive it in-process. */
-export function createApp({ config, logger, pools }) {
+/**
+ * The embedder, or null when no key is configured.
+ *
+ * Constructed eagerly and never used at boot. The client makes no request in
+ * its constructor, so this costs nothing — and constructing it lazily on first
+ * search would move a configuration error into the hot path, where it would
+ * surface as one failed query rather than as a clear message.
+ */
+const embedder = config.providers.apiKey ? createEmbedder({ config, logger }) : null;
+
+if (!embedder) {
+  logger.warn("no embedding provider configured", {
+    note: "retrieval runs on three layers; set OPENROUTER_API_KEY for the vector arm"
+  });
+}
+
+/**
+ * Build the app without starting it, so tests can drive it in-process.
+ *
+ * `embedder` is optional and defaults to null. It is null in CI and in any
+ * build without a key, and the health endpoint has to work there — which is
+ * the same reasoning as the health check making no outbound request.
+ */
+export function createApp({ config, logger, pools, embedder = null }) {
   async function checkPostgres() {
     try {
       const workspaces = await pools.listWorkspaces({ includeInfrastructure: true });
@@ -41,23 +67,63 @@ export function createApp({ config, logger, pools }) {
   }
 
   /**
+   * Index completeness, per workspace.
+   *
+   * Not a health signal. A corpus that is 30% unembedded retrieves perfectly
+   * well, on three layers instead of four — calling that degraded would make
+   * `/health` noisy and train a reader to ignore it. It is reported because
+   * the question "is my index complete" is asked constantly and the answer
+   * should not require a query.
+   *
+   * Null coverage means the count could not be taken, which is different from
+   * zero embedded.
+   */
+  async function checkIndexing() {
+    if (!embedder) {
+      return { status: "no embedder configured", note: "the vector arm is disabled in this build" };
+    }
+    try {
+      const workspaces = await pools.listWorkspaces();
+      const detail = {};
+
+      for (const workspace of workspaces) {
+        const store = createStore({ workspace, pools, logger });
+        try {
+          detail[workspace] = await store.vectorCoverageSummary({ model: embedder.model });
+        } catch (err) {
+          // An unmigrated workspace has no such table. Reported, not fatal.
+          detail[workspace] = { error: err.message };
+        }
+      }
+      return { model: embedder.model, dimensions: embedder.dimensions, workspaces: detail };
+    } catch (err) {
+      return { error: err.message };
+    }
+  }
+
+  /**
    * Provider checks are reported without being called.
    *
    * Phase 2's gate is *zero outbound HTTP requests during startup and health
-   * check*. A health check that pings OpenRouter to prove the key works would
-   * spend money and rate-limit on every container restart. The provider is
-   * reported as `unknown` until something actually uses it, and a real probe
-   * arrives in Phase 4 when there is a call site to attach it to.
+   * check*. That gate holds, and Phase 4 makes it more important rather than
+   * less: a health check that embeds a test string to prove the key works
+   * spends money and burns rate-limit on every container restart, and every
+   * orchestrator's liveness probe would do it on a schedule.
+   *
+   * So the key is checked for *presence*, never for validity. The first real
+   * use is what proves it works, and a failure there is reported by the search
+   * that hit it — with `debug.semantic_error` naming the cause — rather than
+   * by a background ping nobody asked for.
    */
   function checkProviders() {
     const configured = Boolean(config.providers.apiKey);
     const provider = {
       status: configured ? "configured" : "unconfigured",
-      // Deliberately not verified. See above.
+      // Deliberately not verified, and it stays that way. See above.
       verified: false,
       note: configured
         ? "not probed: the health check makes no outbound request by design"
-        : "OPENROUTER_API_KEY is not set"
+        : "OPENROUTER_API_KEY is not set; retrieval runs on three layers"
     };
     return {
       openrouter: provider,
@@ -80,7 +146,11 @@ export function createApp({ config, logger, pools }) {
   }
 
   async function handleHealth() {
-    const [postgres, minio] = await Promise.all([checkPostgres(), checkMinio()]);
+    const [postgres, minio, indexing] = await Promise.all([
+      checkPostgres(),
+      checkMinio(),
+      checkIndexing()
+    ]);
     const providers = checkProviders();
 
     // Overall status is about whether THIS PROCESS can serve. A provider
@@ -95,10 +165,17 @@ export function createApp({ config, logger, pools }) {
       status: healthy ? (degraded.length > 0 ? "degraded" : "ok") : "unhealthy",
       service: "jove-memory",
       version: "0.1.0",
-      phase: 2,
+      // Reported rather than assumed. Phase 2 hardcoded 2 and it stayed there
+      // through Phase 3, which is the kind of stale number nobody notices
+      // because it is not wrong-looking.
+      phase: 4,
       schemaVersion: expectedVersion(),
       uptimeSeconds: Math.round(process.uptime()),
       dependencies: { postgres, minio, providers },
+      // Index completeness, deliberately outside `dependencies`. It is not a
+      // dependency — nothing is broken by it — and putting it there would make
+      // a half-embedded corpus look like an outage.
+      indexing,
       degraded
     };
   }
@@ -111,7 +188,13 @@ export function createApp({ config, logger, pools }) {
         try {
           const stats = await store.stats();
           const caps = await store.capabilities();
-          return { workspace, ...stats, capabilities: caps };
+          // Coverage alongside the counts. A workspace with 5000 items and 0
+          // vectors looks healthy in a stats listing and retrieves on three
+          // layers, which is exactly the surprise this removes.
+          const coverage = embedder
+            ? await store.vectorCoverageSummary({ model: embedder.model })
+            : null;
+          return { workspace, ...stats, capabilities: caps, vectorCoverage: coverage };
         } catch (err) {
           // An unmigrated or unreachable workspace is reported, not hidden.
           return { workspace, error: err.message };
@@ -146,8 +229,8 @@ function send(res, status, body) {
   res.end(payload);
 }
 
-export function createHttpServer({ config, logger, pools }) {
-  const app = createApp({ config, logger, pools });
+export function createHttpServer({ config, logger, pools, embedder = null }) {
+  const app = createApp({ config, logger, pools, embedder });
 
   const server = createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host ?? "localhost"}`);
@@ -171,7 +254,7 @@ export function createHttpServer({ config, logger, pools }) {
       if (req.method === "GET" && url.pathname === "/") {
         return send(res, 200, {
           service: "jove-memory",
-          phase: 2,
+          phase: 4,
           endpoints: ["/health", "/v1/workspaces"]
         });
       }
@@ -201,8 +284,8 @@ export function createHttpServer({ config, logger, pools }) {
 }
 
 /** Start the server and wire graceful shutdown. */
-export async function start({ config, logger, pools }) {
-  const server = createHttpServer({ config, logger, pools });
+export async function start({ config, logger, pools, embedder = null }) {
+  const server = createHttpServer({ config, logger, pools, embedder });
 
   await new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -259,7 +342,7 @@ export async function start({ config, logger, pools }) {
 }
 
 async function main() {
-  const { server, shutdown } = await start({ config, logger, pools });
+  const { server, shutdown } = await start({ config, logger, pools, embedder });
   // Keep the process alive; the http server does that on its own, but an
   // unhandled rejection should not leave a half-dead container.
   process.on("unhandledRejection", (reason) => {

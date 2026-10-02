@@ -250,3 +250,107 @@ about *memories*, which is the line that matters.
 The invariant test now asserts the accurate claim and a second test asserts the comment does not
 overstate itself again. A comment that claims more than the code delivers is the kind of thing
 that gets trusted.
+
+---
+
+## Phase 4 notes — cloud embeddings
+
+### The width check is the whole design
+
+`google/gemini-embedding-2` is 3072 dimensions and the column is `vector(3072)`. The client
+refuses any vector of any other width, and the refusal names the model, both numbers, and the
+offending text.
+
+This is the failure that never surfaces as an error. A 1536-wide vector in a 3072 column either
+gets stored and produces nonsense distances that look like mediocre ranking, or is rejected by
+pgvector three layers away with a message naming neither the text nor the model that produced it.
+Catching it in the client turns a silent wrong answer into one line that says what happened.
+
+It is also why `PARADIGM_EMBED_DIMENSIONS` is not a runtime tuning knob. It is the column width
+from migration 0002. Changing it means re-embedding everything, because two models do not share
+a vector space (ADR-005).
+
+### A base64 string where floats were requested is a hard error
+
+`encoding_format: "float"` is sent explicitly. The default is currently float, so this is belt
+and braces — but a provider that ignored the request and returned base64 would be decoded as a
+float array, producing numbers of the wrong length. Plausible values, wrong answer, no error.
+The client checks the type and refuses.
+
+### `input_type` is a request field, not a per-input field
+
+NVIDIA's `nemotron-3-embed-1b` requires `input_type` of `query` or `passage`, and the same string
+embedded as one and as the other lands in meaningfully different places. A batch mixing queries
+and passages cannot be sent in one request at all, because the field is per-request. The client
+refuses rather than picking one type for the whole batch, which would embed documents as queries
+and degrade every hit in a way nothing would report.
+
+`google/gemini-embedding-2` ignores the field. It is sent only when asked for, and only to a model
+that wants it.
+
+### Missing provider is not a failed provider
+
+`debug.semantic_error` and `debug.semantic_configured` are separate fields, and the distinction is
+load-bearing:
+
+| State | `semantic_error` | `semantic_configured` | What it means |
+| --- | --- | --- | --- |
+| Working | `null` | `true` | Four layers |
+| Key issued, provider down | the reason | `true` | Retry, alert — something is wrong |
+| No key | `null` | `false` | Nobody has issued a key yet |
+
+Reporting the third as an error would train a reader to ignore the second, which is the failure
+mode this is designed to prevent.
+
+### The health check still makes zero outbound requests
+
+The Phase 2 gate held, and Phase 4 made it more important rather than less. A health check that
+embedded a test string to prove the key works would spend money and burn rate-limit on every
+container restart, and every orchestrator's liveness probe would do it on a schedule.
+
+So the key is checked for presence, never for validity. `verified: false` is permanent and
+documented as such. The first real use is what proves it works, and a failure there is reported by
+the search that hit it.
+
+Verified with a key present:
+
+```
+status: ok
+openrouter: configured, verified: false
+indexing: google/gemini-embedding-2, 3072 dims, per-workspace coverage
+outbound requests: 0
+```
+
+### Index completeness is not a health signal
+
+A corpus that is 30% unembedded retrieves perfectly well, on three layers instead of four. It is
+reported under `indexing`, deliberately outside `dependencies` — calling it degraded would make
+`/health` noisy and train a reader to ignore it.
+
+`ratio` is `null` for an empty corpus, not `0`. "Nothing is missing because there is nothing" and
+"nothing is indexed" are different states, and division reports the first as a perfect score.
+
+### An item is stored even when it cannot be embedded
+
+The write happens first. A memory with no vector is still a memory, and blocking the write on a
+provider blip would lose the thing the user asked to remember. `embedItem` returns a result object
+rather than throwing, because a write path needs to know the write succeeded and the embed did
+not — two separate facts.
+
+### What Phase 4 could not verify
+
+The gate has three parts and one is not closable here:
+
+1. ~~A text query returns results ranked by vector similarity~~ — verified
+2. ~~No `semantic_error` in the response~~ — verified
+3. Image query retrieves text items and text query retrieves image items, same index — **not
+   verifiable without a key**
+
+Part 3 is a property of Google's embedding space: whether the model places an image near the text
+describing it is a fact about the model, and a fake embedder has no such property. What the tests
+assert instead is the *mechanism* — both produce a 3072-wide vector, both are written to
+`memory_item_vectors`, exactly one table in the database holds a `vector` column, and both are read
+back by the same distance query. The remaining step is one real request.
+
+This is recorded as unverified rather than assumed. Closing it needs an OpenRouter key, which has
+not been issued to this environment.

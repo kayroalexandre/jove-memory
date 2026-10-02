@@ -999,6 +999,70 @@ export function createStore({ workspace, pools, logger = null, clock = () => new
       }));
     },
 
+    /**
+     * The raw pool for this workspace.
+     *
+     * Reserved for the migration and provisioning work in `migrate.mjs` and
+     * `pool.mjs`, which legitimately need it. Nothing above `src/store/` may
+     * use it — that is what the "only store/ writes SQL" invariant asserts —
+     * so if a change needs a query from outside this directory, the answer is
+     * a method here, not a caller reaching for this.
+     */
+    pool() {
+      return pools.poolFor(workspace);
+    },
+
+    /**
+     * Items with no vector for a given model, most recent first.
+     *
+     * The re-embedding work list, and the thing that answers "how complete is
+     * this index". Invalidated items are included: they are retained facts
+     * with a past, and a query for last March needs their vectors as much as
+     * current facts do.
+     */
+    async listUnembeddedItems({ model, limit = 1000 } = {}) {
+      const { rows } = await pools.poolFor(workspace).query(
+        `SELECT i.id, i.content
+         FROM memory_items i
+         LEFT JOIN memory_item_vectors v ON v.item_id = i.id AND v.model = $1
+         WHERE v.item_id IS NULL
+           AND i.deleted_at IS NULL
+         ORDER BY i.recorded_at DESC
+         LIMIT $2`,
+        [model, limit]
+      );
+      return rows.map((row) => ({ id: row.id, text: row.content }));
+    },
+
+    /**
+     * How much of the corpus is indexed, for one model.
+     *
+     * A number rather than a boolean, because "a few unembedded" and "almost
+     * nothing embedded" call for different responses. `ratio` is null for an
+     * empty corpus rather than 0: "nothing is missing because there is
+     * nothing" and "nothing is indexed" are different states, and division
+     * here would report the first as a perfect score.
+     */
+    async vectorCoverageSummary({ model } = {}) {
+      const { rows } = await pools.poolFor(workspace).query(
+        `SELECT
+           count(*) FILTER (WHERE i.deleted_at IS NULL)::int AS eligible,
+           count(v.item_id) FILTER (WHERE i.deleted_at IS NULL)::int AS embedded
+         FROM memory_items i
+         LEFT JOIN memory_item_vectors v ON v.item_id = i.id AND v.model = $1`,
+        [model]
+      );
+      const eligible = Number(rows[0]?.eligible ?? 0);
+      const embedded = Number(rows[0]?.embedded ?? 0);
+      return {
+        model,
+        eligible,
+        embedded,
+        missing: eligible - embedded,
+        ratio: eligible === 0 ? null : Number((embedded / eligible).toFixed(4))
+      };
+    },
+
     /** Every edge touching an item, in either direction. */
     async edgesFor(itemId) {
       const { rows } = await pools.poolFor(workspace).query(
