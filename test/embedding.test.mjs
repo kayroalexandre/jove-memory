@@ -18,12 +18,28 @@ import { loadConfig } from "../src/config.mjs";
 
 const DIMS = 3072;
 
+/**
+ * A hermetic environment.
+ *
+ * Deliberately not `...process.env`. Spreading it passed the operator's real
+ * HOME through, so a test that set `OPENROUTER_API_KEY: ""` fell through to the
+ * key file and found the actual credential — the "no key" test then failed
+ * because a key was present, and the diff printed it.
+ *
+ * A HOME that does not exist, rather than a temp directory: config only ever
+ * reads, and a real directory would mean a test suite that can be made to write
+ * somewhere by changing a file that does not create anything.
+ */
+const NO_SUCH_HOME = "/nonexistent-jove-test-home";
+
 function testConfig(overrides = {}) {
   return loadConfig({
-    ...process.env,
     POSTGRES_PASSWORD: "unused-in-this-file",
     OPENROUTER_API_KEY: "test-key-never-sent",
     PARADIGM_EMBED_DIMENSIONS: String(DIMS),
+    HOME: NO_SUCH_HOME,
+    JOVE_SECRETS_DIR: undefined,
+    OPENROUTER_API_KEY_FILE: undefined,
     ...overrides
   });
 }

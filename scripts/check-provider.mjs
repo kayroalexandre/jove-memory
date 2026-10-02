@@ -27,7 +27,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { createEmbedder } from "../src/embedding/openrouter.mjs";
-import { loadConfig } from "../src/config.mjs";
+import { loadProviderConfig } from "../src/config.mjs";
 
 // ---------------------------------------------------------------------------
 // A PNG, generated rather than downloaded
@@ -114,7 +114,11 @@ function out(text) {
   process.stdout.write(text);
 }
 
-const config = loadConfig();
+// Provider configuration only. This command talks to OpenRouter and to
+// nothing else, so requiring a database password to run it is a coupling with
+// no purpose — the first run failed on `POSTGRES_PASSWORD is not set` while
+// holding a perfectly good key.
+const config = loadProviderConfig();
 
 if (!config.providers.apiKey) {
   out(

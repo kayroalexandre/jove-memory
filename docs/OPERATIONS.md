@@ -526,3 +526,88 @@ real leak becomes invisible. The first version got the marker pairing wrong and 
 the interpolation anyway. A **negative control** now feeds five real leaks and three
 clean snippets through the same detector, so a detector that goes blind fails a test
 instead of quietly approving.
+
+---
+
+## Phase 4 gate closed: cross-modal retrieval, measured
+
+The last unverified item from Phase 4 needed a real request, and this is it.
+
+```
+text    3072 dimensions
+image   83 bytes, generated locally, sent as a data URL
+        3072 dimensions
+
+Cosine similarity, image vector against two text vectors:
+  vs "a bright white square..."          0.4428   <- describes it
+  vs "a spreadsheet of quarterly..."    0.2205   <- unrelated
+
+GATE CLOSED. The image is 0.2223 nearer the text that describes it.
+```
+
+One index, one embedding space, no second vector store and no query classifier. The
+image was a 32×32 greyscale PNG generated in the checking script — nothing was
+fetched from anywhere, so the only thing that left the machine was a square.
+
+This is a smoke test, not a measurement. One comparison establishes that the
+mechanism works; it does not establish a quality figure. `docs/THRESHOLDS.md` and the
+Phase 6 benchmark are where quality gets measured.
+
+## The container reads the same key file
+
+```
+export JOVE_SECRETS_DIR=$HOME/.local/share/jove-memory
+export JOVE_HOST_UID=$(id -u) JOVE_HOST_GID=$(id -g)
+```
+
+`compose.yml` now runs the API as the host user rather than as the image's `jove`
+account, overriding `USER jove` in the Dockerfile. Without it the container cannot read
+a `600` file owned by the host user, and the refusal is the security property working
+rather than a fault:
+
+```
+ls: can't open '/run/secrets/jove': Permission denied
+```
+
+The trade is deliberate. The alternative is a credential made group- or
+world-readable so the container can reach it, and loosening a credential's
+permissions to make a container work is the wrong direction. What the container can
+reach is bounded by what is mounted, and the only mount is read-only.
+
+## A test printed a real key, and the two fixes
+
+The tests asserting "no key is found" were written before a key existed on this
+machine. Once one was stored, they began reading the operator's actual credential into
+the test process — and `assert.equal(config.providers.apiKey, "")` **printed it in the
+failure diff**.
+
+Two fixes, and the second is the one that matters:
+
+1. **Isolation.** Every config load in those tests now goes through a `noKeyEnv()`
+   helper supplying a scratch `HOME`, so a real key is never visible. The
+   invariant test asserts no `loadConfig` in that file bypasses it.
+
+2. **Never assert on a key's value.** `assertNoKey()` compares a *boolean*, and
+   reports only the length. The invariant forbids comparing a key against
+   emptiness anywhere in the suite — that is the shape of assertion whose failure
+   prints the machine's key.
+
+`test/embedding.test.mjs` had the same defect more quietly: it built its environment
+from `...process.env`, which passed the real `HOME` through, so a test that set
+`OPENROUTER_API_KEY: ""` fell through to the key file and found the real one.
+
+### Rotate the key
+
+A key was printed to a terminal during the diagnosis above. Terminal scrollback,
+terminal scrollback recorded by anything capturing it, and this session's transcript
+all contain it. Treat it as disclosed and rotate:
+
+```bash
+npm run key:set      # paste the new one
+npm run key:check    # confirm
+```
+
+Nothing in the repository, the database or a log ever received it. The exposure is
+the output of one diagnostic, not a persisted file — but the honest response to a
+credential appearing in output is to replace it, not to reason about how unlikely
+exposure is.
