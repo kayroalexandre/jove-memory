@@ -1368,6 +1368,113 @@ export function createStore({ workspace, pools, logger = null, clock = () => new
     },
 
     // -----------------------------------------------------------------------
+    // Cross-workspace edges
+    //
+    // These belong in `_shared` and nowhere else. The store does not enforce
+    // that — a workspace *can* have the table, because the migration runs
+    // everywhere — so `src/retrieval/cross-workspace.mjs` is written to talk
+    // only to the shared store, and a test asserts it does.
+    // -----------------------------------------------------------------------
+
+    /**
+     * Edges from a set of local items outward, in both directions.
+     *
+     * Both directions, because the query may be on either end: a seed in B
+     * might be the `item_from` of an edge whose `item_to` is in A.
+     *
+     * The edge's own confidence is returned with it and filtered by the
+     * caller, not here. This function finds links; whether a weak link is
+     * worth consulting is a retrieval decision, and burying it in a WHERE
+     * clause would make the refusal invisible.
+     */
+    // The parameter is `fromWorkspace`, not `workspace`: a destructured
+    // `workspace` would shadow the store's own and the query would run against
+    // the *searching* workspace's database rather than the shared one — which
+    // is empty of edges by design, so the lookup silently returned nothing and
+    // every cross-workspace test passed for the wrong reason.
+    async findCrossWorkspaceEdges({ fromWorkspace, itemIds, relations = null }) {
+      if (!Array.isArray(itemIds) || itemIds.length === 0) return [];
+
+      const values = [fromWorkspace, itemIds];
+      const filters = [
+        "(workspace_from = $1 AND item_from = ANY($2))",
+        "(workspace_to = $1 AND item_to = ANY($2))"
+      ];
+      void filters;
+
+      if (relations) {
+        values.push(relations);
+        filters.push(`relation = ANY($${values.length})`);
+      }
+
+      const { rows } = await pools.poolFor(workspace).query(
+        `SELECT * FROM cross_workspace_edges
+         WHERE (${filters.slice(0, 2).join(" OR ")})
+           ${relations ? `AND relation = ANY($${values.length})` : ""}
+         ORDER BY confidence DESC, created_at ASC`,
+        relations ? [values[0], values[1], values[2]] : [values[0], values[1]]
+      );
+      return rows.map((row) => ({
+        ...row,
+        confidence: Number(row.confidence)
+      }));
+    },
+
+    /** Record an edge between two workspaces. */
+    async addCrossWorkspaceEdge({
+      workspaceFrom,
+      itemFrom,
+      workspaceTo,
+      itemTo,
+      relation,
+      basis = "entity",
+      confidence = 1,
+      confirmed = false
+    }) {
+      const { rows } = await pools.poolFor(workspace).query(
+        `INSERT INTO cross_workspace_edges
+           (workspace_from, item_from, workspace_to, item_to, relation, basis, confidence, confirmed)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+         ON CONFLICT (workspace_from, item_from, workspace_to, item_to, relation)
+         DO UPDATE SET confidence = EXCLUDED.confidence,
+                       basis = EXCLUDED.basis,
+                       confirmed = cross_workspace_edges.confirmed OR EXCLUDED.confirmed,
+                       updated_at = now()
+         RETURNING *`,
+        [workspaceFrom, itemFrom, workspaceTo, itemTo, relation, basis, confidence, confirmed]
+      );
+      return rows[0] ?? null;
+    },
+
+    async recordCrossWorkspaceAudit({
+      queryHash,
+      fromWorkspace,
+      edgesFound = 0,
+      candidates = 0,
+      admitted = 0,
+      threshold = null,
+      outcome,
+      detail = null
+    }) {
+      await pools.poolFor(workspace).query(
+        `INSERT INTO cross_workspace_audit
+           (query_hash, from_workspace, edges_found, candidates, admitted, threshold_used, outcome, detail)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [queryHash, fromWorkspace, edgesFound, candidates, admitted, threshold, outcome, detail]
+      );
+    },
+
+    async listCrossWorkspaceAudit({ fromWorkspace = null, limit = 50 } = {}) {
+      const { rows } = await pools.poolFor(workspace).query(
+        `SELECT * FROM cross_workspace_audit
+         WHERE ($1::text IS NULL OR from_workspace = $1)
+         ORDER BY at DESC LIMIT $2`,
+        [fromWorkspace, limit]
+      );
+      return rows;
+    },
+
+    // -----------------------------------------------------------------------
     // Search accounting
     // -----------------------------------------------------------------------
 

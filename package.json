@@ -23,7 +23,8 @@
     "key:check": "node scripts/check-provider.mjs",
     "gate:measure": "node scripts/measure-write-gate.mjs",
     "rerank:measure": "node scripts/measure-rerank.mjs",
-    "media:verify": "node scripts/verify-media.mjs"
+    "media:verify": "node scripts/verify-media.mjs",
+    "cross:verify": "node scripts/verify-cross-workspace.mjs"
   },
   "dependencies": {
     "pg": "^8.23.1"
