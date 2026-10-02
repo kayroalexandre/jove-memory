@@ -192,6 +192,63 @@ function apiKeySource() {
   return resolvedKeySource;
 }
 
+/**
+ * The provider section, resolvable without a database credential.
+ *
+ * Exists because `npm run key:check` does not need PostgreSQL, and requiring a
+ * database password to verify an API key is a coupling with no purpose: the
+ * first run of that command failed on `POSTGRES_PASSWORD is not set` while
+ * holding a perfectly good key.
+ *
+ * It also means the dependency runs the right way round. A key can be
+ * diagnosed without a database; a database cannot be diagnosed without the
+ * rest of the stack.
+ */
+export function providerSection(env = process.env) {
+  return {
+    providers: {
+      // Not `required`. The stack must be able to start, and serve health,
+      // before any key exists — that is Phase 2's whole gate. A missing key
+      // makes every provider-backed operation fail loudly at the call site,
+      // which is where the error is actionable, rather than at boot where it
+      // only says "something is unset".
+      //
+      // The health endpoint reports the absence. Nothing silently degrades.
+      //
+      // Read from a file as well as the environment — see `readApiKey`.
+      apiKey: readApiKey(env),
+      // Which source answered, for the health endpoint. Never the value.
+      // "I set it and the container cannot see it" and "I never set it" are
+      // the two failures people actually hit.
+      keySource: apiKeySource(),
+      baseUrl: optional("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+      embedModel: optional("PARADIGM_EMBED_MODEL", "google/gemini-embedding-2"),
+      decisionModel: optional("PARADIGM_DECISION_MODEL", "upstage/solar-decide"),
+      inferenceModel: optional("PARADIGM_INFERENCE_MODEL", "qwen/qwen3.8-flash"),
+      fallbackInferenceModel: optional(
+        "PARADIGM_FALLBACK_INFERENCE_MODEL",
+        "deepseek/deepseek-v4-flash"
+      ),
+      requestTimeoutMs: int("PARADIGM_PROVIDER_TIMEOUT_MS", 30000)
+    },
+
+    embedding: {
+      // 3072 for gemini-embedding-2. The schema is created at this width, so
+      // changing it means re-embedding everything (ADR-005).
+      dimensions: int("PARADIGM_EMBED_DIMENSIONS", 3072),
+      // Texts per HTTP request. Not a tuning knob for speed: it is a request
+      // size, and one 100-item batch that gets rejected costs more than ten
+      // accepted ones.
+      batchSize: int("PARADIGM_EMBED_BATCH_SIZE", 32)
+    }
+  };
+}
+
+/** Provider configuration alone, with no other credential required. */
+export function loadProviderConfig(env = process.env) {
+  return providerSection(env);
+}
+
 export function loadConfig(env = process.env) {
   const previous = process.env;
   if (env !== process.env) process.env = env;
@@ -230,32 +287,7 @@ export function loadConfig(env = process.env) {
         region: optional("MINIO_REGION", "us-east-1")
       },
 
-      providers: {
-        // Not `required`. The stack must be able to start, and serve health,
-        // before any key exists — that is Phase 2's whole gate. A missing key
-        // makes every provider-backed operation fail loudly at the call site,
-        // which is where the error is actionable, rather than at boot where it
-        // only says "something is unset".
-        //
-        // The health endpoint reports the absence. Nothing silently degrades.
-        //
-        // Read from a file as well as the environment — see `readApiKey`.
-        apiKey: readApiKey(env),
-      // Which of the three sources answered, for the health endpoint. Never
-      // the value. "I set it and the container cannot see it" and "I never set
-      // it" are the two failures people actually hit, and the source tells
-      // them apart immediately.
-      keySource: apiKeySource(),
-        baseUrl: optional("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-        embedModel: optional("PARADIGM_EMBED_MODEL", "google/gemini-embedding-2"),
-        decisionModel: optional("PARADIGM_DECISION_MODEL", "upstage/solar-decide"),
-        inferenceModel: optional("PARADIGM_INFERENCE_MODEL", "qwen/qwen3.8-flash"),
-        fallbackInferenceModel: optional(
-          "PARADIGM_FALLBACK_INFERENCE_MODEL",
-          "deepseek/deepseek-v4-flash"
-        ),
-        requestTimeoutMs: int("PARADIGM_PROVIDER_TIMEOUT_MS", 30000)
-      },
+      ...providerSection(env),
 
       thresholds: {
         // Starting values, not final ones. These get measured, not trusted.
@@ -264,17 +296,6 @@ export function loadConfig(env = process.env) {
         rerank: Number(optional("PARADIGM_THRESHOLD_RERANK", "0.60")),
         crossWorkspace: Number(optional("PARADIGM_THRESHOLD_CROSS_WORKSPACE", "0.75"))
       },
-
-      embedding: {
-        // 3072 for gemini-embedding-2. The schema is created at this width, so
-        // changing it means re-embedding everything (ADR-005).
-        dimensions: int("PARADIGM_EMBED_DIMENSIONS", 3072),
-        // Texts per HTTP request. Not a tuning knob for speed: it is a request
-        // size, and one 100-item batch that gets rejected costs more than ten
-        // accepted ones. 32 keeps a batch well inside every provider's limit
-        // while still amortising the round trip.
-        batchSize: int("PARADIGM_EMBED_BATCH_SIZE", 32)
-      }
     };
   } finally {
     if (env !== previous) process.env = previous;

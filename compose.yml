@@ -14,6 +14,18 @@ services:
     image: jove-memory-api:dev
     container_name: jove-api
     restart: unless-stopped
+    # Runs as the host user rather than as the image's `jove` account, so it can
+    # read a credential file that is mode 600 and owned by that user.
+    #
+    # This overrides `USER jove` in the Dockerfile. The trade is deliberate: the
+    # alternative is a credential that has to be group- or world-readable for
+    # the container, and loosening a credential's permissions to make a
+    # container work is the wrong direction. What the container can reach is
+    # bounded by what is mounted, and the only mount here is read-only.
+    #
+    # Set both from the shell when your ids differ from 1000:1000:
+    #   export JOVE_HOST_UID=$(id -u) JOVE_HOST_GID=$(id -g)
+    user: "${JOVE_HOST_UID:-1000}:${JOVE_HOST_GID:-1000}"
     ports:
       - "127.0.0.1:8888:8888"
     env_file:

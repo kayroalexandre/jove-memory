@@ -4,6 +4,7 @@ import { mkdtempSync, writeFileSync, mkdirSync, rmSync, existsSync, readFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import * as configModule from "../src/config.mjs";
 import { loadConfig } from "../src/config.mjs";
 
 /**
@@ -29,13 +30,45 @@ function scratch() {
   return mkdtempSync(join(tmpdir(), "jove-key-"));
 }
 
+/**
+ * An environment with no key anywhere in it.
+ *
+ * Every test in this file goes through here, and that is not tidiness. These
+ * tests were written before a key existed on this machine, so they passed
+ * `{...BASE} HOME: scratch()` and nothing else — and once a real key was stored
+ * under the real home directory, the tests that assert "no key is found"
+ * started reading the operator's actual credential into the test process, and
+ * printed it in the assertion diff.
+ *
+ * So the isolation is explicit and total: a scratch HOME, and no reliance on
+ * the absence of an environment variable that happens to be unset today.
+ */
+function noKeyEnv(extra = {}) {
+  return { ...BASE, ...extra, HOME: scratch(), JOVE_SECRETS_DIR: undefined };
+}
+
+/**
+ * Assert about a key without ever putting its value in a failure message.
+ *
+ * `assert.equal(config.providers.apiKey, "")` prints `actual`, and when the
+ * real key was found that printed the real key. A boolean comparison says the
+ * same thing and cannot leak.
+ */
+function assertNoKey(config, context) {
+  assert.equal(
+    config.providers.apiKey === "",
+    true,
+    `${context}: expected no key, found a ${config.providers.apiKey.length}-character value`
+  );
+  assert.equal(config.providers.keySource, null, `${context}: and no source`);
+}
+
 test("no key anywhere is an empty string, not a crash", () => {
   // The stack has to start and serve health without one — Phase 2's gate.
   // A missing key that throws at boot turns "not configured yet" into a
   // crash-loop.
-  const config = loadConfig({ ...BASE, HOME: scratch() });
-  assert.equal(config.providers.apiKey, "");
-  assert.equal(config.providers.keySource, null);
+  const config = loadConfig(noKeyEnv());
+  assertNoKey(config, "empty environment");
 });
 
 test("the key is read from a file outside the repository", () => {
@@ -43,7 +76,7 @@ test("the key is read from a file outside the repository", () => {
   const file = join(dir, "openrouter.key");
   writeFileSync(file, KEY);
 
-  const config = loadConfig({ ...BASE, OPENROUTER_API_KEY_FILE: file });
+  const config = loadConfig(noKeyEnv({ OPENROUTER_API_KEY_FILE: file }));
 
   assert.equal(config.providers.apiKey, KEY);
   assert.equal(config.providers.keySource, `file:${file}`);
@@ -56,7 +89,7 @@ test("a key file inside the repository is refused outright", () => {
   // clicked past exactly once.
   const repoLocal = join(process.cwd(), ".env.local");
   assert.throws(
-    () => loadConfig({ ...BASE, OPENROUTER_API_KEY_FILE: repoLocal }),
+    () => loadConfig(noKeyEnv({ OPENROUTER_API_KEY_FILE: repoLocal })),
     (err) => {
       assert.match(err.message, /Refusing to read a provider key from inside the project/);
       assert.match(err.message, /git add/);
@@ -68,7 +101,7 @@ test("a key file inside the repository is refused outright", () => {
 
 test("a repository-relative path is caught, not just an absolute one", () => {
   assert.throws(
-    () => loadConfig({ ...BASE, OPENROUTER_API_KEY_FILE: "./secrets/openrouter.key" }),
+    () => loadConfig(noKeyEnv({ OPENROUTER_API_KEY_FILE: "./secrets/openrouter.key" })),
     /Refusing to read a provider key from inside the project/
   );
 });
@@ -83,7 +116,7 @@ test("a home directory that happens to be named like the project is allowed", ()
   mkdirSync(nested, { recursive: true });
   writeFileSync(join(nested, "openrouter.key"), KEY);
 
-  const config = loadConfig({ ...BASE, OPENROUTER_API_KEY_FILE: join(nested, "openrouter.key") });
+  const config = loadConfig(noKeyEnv({ OPENROUTER_API_KEY_FILE: join(nested, "openrouter.key") }));
   assert.equal(config.providers.apiKey, KEY);
   rmSync(dir, { recursive: true, force: true });
 });
@@ -97,7 +130,7 @@ test("trailing whitespace and quotes are stripped", () => {
 
   for (const messy of [`${KEY}\n`, `  ${KEY}  `, `"${KEY}"`, `'${KEY}'`, `\n${KEY}\n\n`]) {
     writeFileSync(file, messy);
-    const config = loadConfig({ ...BASE, OPENROUTER_API_KEY_FILE: file });
+    const config = loadConfig(noKeyEnv({ OPENROUTER_API_KEY_FILE: file }));
     assert.equal(config.providers.apiKey, KEY, `failed to clean up ${JSON.stringify(messy)}`);
   }
   rmSync(dir, { recursive: true, force: true });
@@ -114,7 +147,7 @@ test("an environment key wins over a file, and says so", () => {
   // matches the repository's own secret-scan. A literal here is a literal
   // here, and push protection would block the commit — correctly.
   const fromEnv = `${KEY.split("-").slice(0, 3).join("-")}-from-the-environment`;
-  const config = loadConfig({ ...BASE, OPENROUTER_API_KEY: fromEnv, OPENROUTER_API_KEY_FILE: file });
+  const config = loadConfig(noKeyEnv({ OPENROUTER_API_KEY: fromEnv, OPENROUTER_API_KEY_FILE: file }));
 
   assert.equal(config.providers.apiKey, fromEnv);
   assert.equal(config.providers.keySource, "environment");
@@ -123,9 +156,8 @@ test("an environment key wins over a file, and says so", () => {
 
 test("a missing key file is not an error, just a missing key", () => {
   // Most deployments have no key. The health endpoint has to work there.
-  const config = loadConfig({ ...BASE, OPENROUTER_API_KEY_FILE: join(scratch(), "absent") });
-  assert.equal(config.providers.apiKey, "");
-  assert.equal(config.providers.keySource, null);
+  const config = loadConfig(noKeyEnv({ OPENROUTER_API_KEY_FILE: join(scratch(), "absent") }));
+  assertNoKey(config, "absent file");
 });
 
 test("an empty key file is treated as no key", () => {
@@ -135,8 +167,8 @@ test("an empty key file is treated as no key", () => {
   const file = join(dir, "openrouter.key");
   writeFileSync(file, "\n   \n");
 
-  const config = loadConfig({ ...BASE, OPENROUTER_API_KEY_FILE: file });
-  assert.equal(config.providers.apiKey, "");
+  const config = loadConfig(noKeyEnv({ OPENROUTER_API_KEY_FILE: file }));
+  assertNoKey(config, "empty file");
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -148,10 +180,10 @@ test("the source is reset between loads", () => {
   const file = join(dir, "openrouter.key");
   writeFileSync(file, KEY);
 
-  loadConfig({ ...BASE, OPENROUTER_API_KEY_FILE: file });
-  const second = loadConfig({ ...BASE, HOME: scratch() });
+  loadConfig(noKeyEnv({ OPENROUTER_API_KEY_FILE: file }));
+  const second = loadConfig(noKeyEnv());
 
-  assert.equal(second.providers.keySource, null);
+  assertNoKey(second, "second load");
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -302,4 +334,44 @@ test("the health endpoint reports the key source, never the key", () => {
     !/source:\s*config\.providers\.apiKey/.test(source),
     "the source field must never be assigned the value"
   );
+});
+
+// ---------------------------------------------------------------------------
+// Provider configuration without a database
+// ---------------------------------------------------------------------------
+
+test("provider configuration resolves without a database credential", () => {
+  // `npm run key:check` talks to OpenRouter and to nothing else. Its first run
+  // failed on `POSTGRES_PASSWORD is not set` while holding a perfectly good
+  // key — a coupling with no purpose, and the wrong way round: a key can be
+  // diagnosed without a database, but a database cannot be diagnosed without
+  // the rest of the stack.
+  const config = configModule.loadProviderConfig({});
+
+  assert.equal(config.providers.embedModel, "google/gemini-embedding-2");
+  assert.equal(config.embedding.dimensions, 3072);
+  assert.ok(config.embedding.batchSize > 0);
+});
+
+test("the provider section and the full config cannot drift", () => {
+  // `loadConfig` spreads `providerSection`, so there is one definition. A field
+  // added to one and not the other would be invisible in code review.
+  //
+  // Compared by shape rather than by value. `deepEqual` on the objects prints
+  // every field on failure — which is how a real key reached a test log from
+  // this very file.
+  const section = configModule.loadProviderConfig(noKeyEnv());
+  const full = loadConfig(noKeyEnv());
+
+  assert.deepEqual(Object.keys(full.providers).sort(), Object.keys(section.providers).sort());
+  assert.deepEqual(Object.keys(full.embedding).sort(), Object.keys(section.embedding).sort());
+
+  // And the non-secret values must be identical, field by field.
+  for (const key of Object.keys(section.providers)) {
+    if (key === "apiKey" || key === "keySource") continue;
+    assert.equal(full.providers[key], section.providers[key], `providers.${key} differs`);
+  }
+  for (const key of Object.keys(section.embedding)) {
+    assert.equal(full.embedding[key], section.embedding[key], `embedding.${key} differs`);
+  }
 });

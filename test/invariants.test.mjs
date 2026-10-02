@@ -367,6 +367,60 @@ test("a missing key is a runtime error, never a silent degradation", () => {
   );
 });
 
+test("no test compares a key against the expectation of emptiness", () => {
+  // A test asserting "no key was found" compares the key to an empty string,
+  // and `assert.equal` prints `actual` when it fails. So the moment a real key
+  // exists on the machine, a failing such test prints the real key.
+  //
+  // This happened: these tests were written before a key was stored, then the
+  // "no key" ones began reading the operator's actual credential and printed it
+  // in the diff.
+  //
+  // Scoped to emptiness deliberately. Comparing against a locally-constructed
+  // fixture is fine and there are several of those; comparing against `""`,
+  // `null` or `undefined` is the assertion whose failure prints the machine's
+  // key. Comments are stripped first, because this file's own explanation of the
+  // rule contains the pattern it forbids.
+  const empty = /assert\.(equal|strictEqual|ok)\(\s*[\w.\[\]]*apiKey\s*,\s*(?:""|''|undefined|null)|assert\.ok\(\s*!\s*[\w.\[\]]*apiKey\b/;
+
+  for (const file of readdirSync("test")) {
+    if (!file.endsWith(".mjs")) continue;
+    const code = stripComments(readFileSync(join("test", file), "utf8"));
+    assert.ok(
+      !empty.test(code),
+      `${file} compares a key against emptiness. assert.equal prints the value on ` +
+        `failure, which is how a real key reached a test log. Use assertNoKey().`
+    );
+  }
+
+  // And the helper it prescribes exists, so the rule is actionable.
+  const providerKey = readFileSync("test/provider-key.test.mjs", "utf8");
+  assert.match(providerKey, /function assertNoKey/);
+  assert.match(
+    providerKey,
+    /apiKey === ""/,
+    "the helper must compare a boolean, never the value"
+  );
+});
+
+test("key-reading tests are isolated from the real home directory", () => {
+  const source = readFileSync("test/provider-key.test.mjs", "utf8");
+  assert.match(
+    source,
+    /function noKeyEnv/,
+    "a single helper must supply a scratch HOME to every load in the file"
+  );
+
+  // Every `loadConfig` in that file goes through the helper.
+  const loads = [...source.matchAll(/loadConfig\(([^)]*)\)/g)].map((m) => m[1].trim());
+  const bare = loads.filter((args) => args !== "noKeyEnv()" && !args.startsWith("noKeyEnv("));
+  assert.deepEqual(
+    bare,
+    [],
+    `these loads do not isolate HOME, so they can see a real key: ${bare.join(" | ")}`
+  );
+});
+
 test("the key never has to be typed into a command or a file in the repository", () => {
   // The setup path is a prompt with echo off writing outside the project. If
   // someone replaces it with `KEY=... npm run` or puts the value in .env, this
@@ -482,3 +536,16 @@ test("the model documented in ARCHITECTURE.md matches .env.example", () => {
     );
   }
 });
+
+/**
+ * Remove comments.
+ *
+ * Needed because an invariant that forbids a pattern will be described
+ * somewhere using the pattern it forbids, and a scanner that reads its own
+ * documentation reports a violation in the documentation.
+ */
+function stripComments(source) {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/(^|[^:])\/\/[^\n]*/g, "$1 ");
+}
