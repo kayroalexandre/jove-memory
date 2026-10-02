@@ -30,7 +30,13 @@ import { filterValidAt, rankTemporally, DEFAULT_HALF_LIFE_DAYS } from "./tempora
 /** How many candidates each arm contributes before fusion. */
 const DEFAULT_ARM_LIMIT = 20;
 
-export function createSearcher({ store, logger = null, weights = DEFAULT_WEIGHTS, embed = null }) {
+export function createSearcher({
+  store,
+  logger = null,
+  weights = DEFAULT_WEIGHTS,
+  embed = null,
+  rerank = null
+}) {
   /**
    * @param {string} query
    * @param {object} [options]
@@ -60,7 +66,12 @@ export function createSearcher({ store, logger = null, weights = DEFAULT_WEIGHTS
       includeDeleted = false,
       includeInvalidated = false,
       persist = true,
-      weights: weightOverride = null
+      weights: weightOverride = null,
+      // Rerank is opt-out. Off by default here because a search that calls a
+      // third-party model per candidate adds seconds to every query; Phase 6
+      // turns it on for the paths where that is worth it.
+      rerank: rerankRequested = false,
+      rerankTopK = 20
     } = options;
 
     const activeWeights = { ...weights, ...(weightOverride ?? {}) };
@@ -217,8 +228,33 @@ export function createSearcher({ store, logger = null, weights = DEFAULT_WEIGHTS
     const allFourRan = Object.values(armReport).every((a) => a.ran);
     const allFourReported = Object.keys(armReport).length === 4;
 
+    // -- Rerank, over the fused shortlist ----------------------------------
+    //
+    // After fusion, not instead of it. The four arms decide *which* memories
+    // are candidates; rerank only reorders that set. Reranking before fusion
+    // would let one arm's opinion reorder another arm's results, which is the
+    // exact thing fusing exists to prevent.
+    let final = fused.results;
+    let rerankReport = { ranked: false, reason: "not requested" };
+
+    if (rerankRequested) {
+      const outcome = await rerank({
+        query: trimmed,
+        results: fused.results.slice(0, rerankTopK),
+        topK: rerankTopK
+      });
+      final = [...outcome.results, ...fused.results.slice(rerankTopK)];
+      rerankReport = {
+        ranked: outcome.ranked,
+        reason: outcome.reason,
+        unranked: outcome.unranked ?? 0,
+        cost: outcome.cost ?? 0,
+        latencyMs: outcome.latencyMs ?? 0
+      };
+    }
+
     const tookMs = Date.now() - started;
-    const results = fused.results.slice(0, limit);
+    const results = final.slice(0, limit);
 
     const response = {
       query: trimmed,
@@ -240,7 +276,13 @@ export function createSearcher({ store, logger = null, weights = DEFAULT_WEIGHTS
           lexical: r.payload.normalised ?? null,
           graphDepth: r.payload.depth ?? null,
           relation: r.payload.relation ?? null,
-          recency: r.payload.recency ?? null
+          recency: r.payload.recency ?? null,
+          // The decision model's verdict, when there was one. Present and null
+          // is different from absent: null means "this candidate was not
+          // judged", and a caller reading `rerank` cannot otherwise tell that
+          // from "the field is from an older build".
+          rerank: r.rerank ?? null,
+          rerankReason: r.rerankReason ?? null
         }
       })),
       debug: {
@@ -281,6 +323,15 @@ export function createSearcher({ store, logger = null, weights = DEFAULT_WEIGHTS
          * deployment rather than of any one search.
          */
         semantic_configured: status.vector?.configured !== false,
+        /**
+         * Rerank, reported separately from the fusion.
+         *
+         * `ranked: false` with a reason is the important case: the results are
+         * in RRF order and the caller is told so. A search that quietly returns
+         * unranked results while claiming to be ranked is the failure this
+         * field exists to make impossible.
+         */
+        rerank: rerankReport,
         bm25Engine: await bm25EngineOf(store),
         embedModel: arms.vector[0]?.embedModel ?? null,
         vectorCoverage: await safeReport(() => store.vectorCoverage(), logger),

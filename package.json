@@ -21,7 +21,8 @@
     "verify": "npm run lint && npm run secret-scan && npm test",
     "key:set": "node scripts/set-provider-key.mjs",
     "key:check": "node scripts/check-provider.mjs",
-    "gate:measure": "node scripts/measure-write-gate.mjs"
+    "gate:measure": "node scripts/measure-write-gate.mjs",
+    "rerank:measure": "node scripts/measure-rerank.mjs"
   },
   "dependencies": {
     "pg": "^8.23.1"
