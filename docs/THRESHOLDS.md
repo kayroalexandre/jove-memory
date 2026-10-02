@@ -181,3 +181,86 @@ Even when calibration runs:
   context boundary is a one-way decision and requires explicit human action.
 - **Every adjustment is recorded** in the audit log alongside the decision model id and version
   that produced the measurement.
+
+---
+
+## Measured: the write gate against `upstage/solar-decide`, 2026-10-02
+
+103 valid writes, 118 noise writes, threshold 0.60. 221 calls, 0.004845 credits,
+3.2s mean latency. Reproduce with `npm run gate:measure`.
+
+```
+set        n     min    p10   median    p90     max   mean    stored  proposed
+valid     103   0.000  0.001   0.123  0.934  1.000  0.307       26        77
+noise     118   0.008  0.015   0.022  0.035  0.089  0.025        0       118
+```
+
+### The distributions
+
+```
+bucket      valid   noise
+0.00-0.05      43     114
+0.05-0.10       9       4
+0.10-0.20      18       0
+0.20-0.30       4       0
+0.30-0.50       0       0
+0.50-0.70       3       0
+0.70-0.90       8       0
+0.90-1.01      18       0
+```
+
+**The separation is real, and it is above 0.10.** Not one noise item scored above
+0.089, and 51 valid items scored above 0.10 with a clean staircase to 1.0. Any
+threshold between 0.09 and 0.10 admits zero noise.
+
+**52 of 103 valid items scored below 0.10 — the same range as noise.** That is the
+finding, and it is not a threshold problem.
+
+### Why the threshold is not the thing to change
+
+Sweeping every midpoint for the minimum of `valid demoted + noise admitted`:
+
+| Threshold | Valid demoted | Noise admitted |
+| --- | --- | --- |
+| 0.60 (in force) | 77 of 103 | 0 of 118 |
+| 0.044 (best this data) | 40 of 103 | 6 of 118 |
+
+Lowering the threshold trades a review queue nobody will read for a smaller
+review queue plus noise in the corpus. Neither is a fix.
+
+The 52 items the model cannot separate from noise are the interesting ones. They are
+short declarative facts — "the user has a standing desk and it is 118cm high", "the
+user's laptop is a ThinkPad T14" — with no indication that the user wanted them
+remembered. The current instruction tells the model to reject "content the assistant
+already knows or can look up", and a bare fact about a laptop is arguably exactly
+that.
+
+So the question is underspecified, not the number. Three ways to fix it, none of
+them a threshold change:
+
+1. **Say what "worth remembering" means in this system.** The instruction currently
+   defines it by exclusion (not chatter, not lookable-up, not asked). A positive
+   definition — a durable fact about the user that changes how a later answer should
+   be given — is a different question.
+2. **Let the caller's intent count.** `memory_write` knows whether this came from an
+   explicit "remember this". A caller-supplied signal is not the model guessing at
+   intent from a fragment of text.
+3. **Re-measure with realistic input.** 103 hand-written items are not what a memory
+   system receives. Phase 9 migrates real memory, and the honest measurement is
+   against that corpus, not against a list written to be unambiguous.
+
+### What was not done
+
+No threshold was changed. This document is explicit that a calibration number is a
+proposal that opens a pull request, and that a number produced by one measurement on a
+synthetic corpus is not a number to act on. The measurement is recorded so the next one
+can be compared against it.
+
+### Two operational notes from the same run
+
+- **3.2s mean latency per decision.** On a write path that is the dominant cost of
+  remembering something, and it is spent before the write completes. Worth measuring
+  on a real corpus before deciding it is acceptable; a caller that wants a fast
+  acknowledgement may need to write first and gate after.
+- **$0.0048 for 221 calls.** Cost is not a constraint here. Latency and accuracy are
+  the constraints, and they are very different problems.
