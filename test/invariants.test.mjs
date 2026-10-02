@@ -336,8 +336,16 @@ test("a missing key is a runtime error, never a silent degradation", () => {
   // Phase 2's finding, kept as an invariant. A build with no key must still
   // start and serve health, but every *use* must fail loudly.
   const config = readFileSync("src/config.mjs", "utf8");
-  const embedLine = config.match(/apiKey: optional\("OPENROUTER_API_KEY", ""\)/);
-  assert.ok(embedLine, "the key must be optional at boot, or the stack cannot start without one");
+  assert.match(
+    config,
+    /apiKey: readApiKey\(\)/,
+    "the key must resolve to an empty string when absent, not throw at boot"
+  );
+  assert.match(
+    config,
+    /assertOutsideRepository/,
+    "and it must refuse a key stored inside the repository"
+  );
 
   const client = readFileSync("src/embedding/openrouter.mjs", "utf8");
   assert.match(
@@ -351,6 +359,32 @@ test("a missing key is a runtime error, never a silent degradation", () => {
     search,
     /semantic_configured/,
     "search responses must distinguish 'not configured' from 'failed'"
+  );
+});
+
+test("the key never has to be typed into a command or a file in the repository", () => {
+  // The setup path is a prompt with echo off writing outside the project. If
+  // someone replaces it with `KEY=... npm run` or puts the value in .env, this
+  // fails — which is the point, because both leak into history or into a
+  // directory that gets published.
+  const compose = readFileSync("compose.yml", "utf8");
+  assert.ok(
+    !/OPENROUTER_API_KEY\s*:/i.test(compose),
+    "compose.yml must not set the key as a variable — it is a mounted file"
+  );
+  assert.match(
+    compose,
+    /read_only: true/,
+    "and the secrets mount must be read-only: the container has no reason to write a credential"
+  );
+
+  const envExample = readFileSync(".env.example", "utf8");
+  const keyLine = envExample.split("\n").find((l) => l.startsWith("OPENROUTER_API_KEY="));
+  assert.ok(keyLine, "the variable must still be documented for CI");
+  assert.equal(
+    keyLine.split("=")[1].trim(),
+    "",
+    "with an empty value — the template is for the environment, and the key itself lives in a file"
   );
 });
 
