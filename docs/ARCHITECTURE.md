@@ -18,7 +18,7 @@ live in one engine, in one transaction, against one set of indexes:
 
 | Layer | Implementation | What it contributes |
 | --- | --- | --- |
-| Vector | `pgvector` with HNSW | Semantic similarity |
+| Vector | `pgvector`, exact search (no ANN index — see below) | Semantic similarity |
 | Text | `pg_search` (ParadeDB) | True BM25, keyword-exact matches |
 | Graph | `entity_edges` + `WITH RECURSIVE` | Relationship traversal |
 | Temporal | bitemporal columns | "What was true when" |
@@ -122,6 +122,23 @@ the migration surface, and needs a query classifier to pick between them.
 re-embedding everything, because Gemini Embedding 2 and Voyage Multimodal 3.5 do not share a
 vector space. Model choice is therefore a Phase 9 decision, not a runtime toggle.
 
+**The cost of 3072 dimensions, measured:** pgvector 0.8.6 refuses an HNSW index above 2000
+dimensions.
+
+```
+ERROR:  column cannot have more than 2000 dimensions for hnsw index
+```
+
+So the vector arm runs an **exact** search — a sequential scan computing cosine distance per
+row. Latency is linear in corpus size, which is fine at the few thousand memories a personal
+memory system holds and not fine at a million. Ranking *quality* is unaffected: an exact search
+returns the true nearest neighbours, and Phase 6's benchmark measures accuracy, not latency.
+
+The escape hatch is a narrower embedding. Gemini Embedding 2 accepts 128–3072, and 1536 or 2048
+would permit HNSW. That is a data migration rather than a config edit, so it is a decision to
+make when the corpus needs it rather than in advance. Recorded in `0002_retrieval.sql` next to
+the absence, so the next person does not assume it was forgotten.
+
 **Fallback:** if the model is unavailable, the system degrades to BM25-only retrieval and
 reports it in the `debug` block of the search response. It does not silently return worse
 results without saying so.
@@ -194,7 +211,7 @@ query
   ├─ decision model → intent (choice): search | consolidate | none
   │
   ├─ four parallel arms
-  │    ├─ vector    : pgvector HNSW, top-K
+  │    ├─ vector    : pgvector exact cosine, top-K (no ANN: 3072 > pgvector's 2000-dim HNSW limit)
   │    ├─ BM25      : pg_search, top-K
   │    ├─ graph     : entity traversal from the query's entities
   │    └─ temporal  : facts valid in the requested window
@@ -266,4 +283,7 @@ rather than feature appeal.
 | `mcp/` | Tool surface | everything above |
 | `api/` | REST surface | everything above |
 
-No module reaches into another module's internals. The store is the only thing that touches SQL.
+No module reaches into another module's internals. `store/` is the only thing that writes SQL
+about memories — `migrate.mjs` applies DDL and `pool.mjs` runs the `CREATE DATABASE` and
+`pg_stat_activity` queries the one-database-per-workspace design needs, but those are statements
+about databases, not about memories.

@@ -179,3 +179,74 @@ POSTGRES_POOL_MAX_PER_WORKSPACE`. PostgreSQL's default `max_connections` is 100.
 The default here is 4, not 10, and the integration suite runs serially for the
 same reason: forty pools opening at once exhaust the server, and that failure
 looks like a database fault rather than a resource-management one.
+
+---
+
+## Phase 3 notes — what the four layers revealed
+
+### pgvector cannot index 3072 dimensions
+
+`docs/ARCHITECTURE.md` specified HNSW. pgvector 0.8.6 refuses it:
+
+```
+ERROR:  column cannot have more than 2000 dimensions for hnsw index
+```
+
+`google/gemini-embedding-2` is 3072 and the width is not negotiable without re-embedding
+everything (ADR-005). So the vector arm is an **exact** search — a sequential scan computing
+cosine per row.
+
+What that costs: latency linear in corpus size. Acceptable at a few thousand memories, which is
+what a personal system holds. Not acceptable at a million.
+
+What it does not cost: accuracy. An exact search returns the true nearest neighbours, so the
+Phase 6 rerank benchmark measures something unaffected by this.
+
+Escape hatch: Gemini Embedding 2 accepts 128–3072, and 1536 or 2048 permits HNSW. That is a data
+migration, not a config edit. Decided when the corpus needs it.
+
+### The distance floor defaults to *no floor*
+
+`minSimilarity` defaults to `null`, which applies no floor — so the vector arm returns the K
+nearest items to **any** query, including one about something entirely absent from memory. A
+nearest-K query has no notion of "close enough": the K-th neighbour comes back whether its
+similarity is 0.9 or 0.02.
+
+That is the correct default for a build whose floor is not yet calibrated, and it is why "nothing
+relevant is stored" and "the index is broken" are indistinguishable without one. A floor of zero
+is a real floor and is not the same as no floor; the code distinguishes them and so should a
+caller reading a response. Added to `docs/THRESHOLDS.md` as a value to measure.
+
+### Graph traversal is bounded, and the bound is correctness
+
+`maxDepth` is capped at 3. A memory graph will have cycles the moment two memories mention the
+same entity, and an unbounded recursive walk over a cycle is a query that never returns. The
+recursive term also carries a path array, so a walk cannot revisit a node it has already passed
+through.
+
+There is deliberately **no** `id <> ALL(seeds)` filter on the final result. With ten seeds — which
+is what arms 1 and 2 return — it would exclude every item in the corpus. An earlier version had
+one, and the symptom was a graph arm that always reported zero hits against a corpus it could
+reach. Overlap between arms is what RRF exists to reward.
+
+### The `search_vector` column is generated, and tags reach it as JSONB text
+
+```sql
+setweight(to_tsvector('english', coalesce(tags::text, '')), 'B')
+```
+
+`array_to_string(ARRAY(SELECT jsonb_array_elements_text(tags)), ' ')` is the obvious version and
+does not work: a generated column may not contain a subquery. The JSONB serialisation is
+immutable, which a subquery-built expression is not guaranteed to be. The tokens come out the
+same — JSON punctuation is not word material to the text parser.
+
+### `store.mjs` did not own all the SQL, and the comment said it did
+
+The header claimed to be the only module in the project writing SQL. Two siblings legitimately
+do: `migrate.mjs` applies DDL, `pool.mjs` runs the `CREATE DATABASE` and `pg_stat_activity`
+queries that one-database-per-workspace depends on. Those are statements about *databases*, not
+about *memories*, which is the line that matters.
+
+The invariant test now asserts the accurate claim and a second test asserts the comment does not
+overstate itself again. A comment that claims more than the code delivers is the kind of thing
+that gets trusted.
